@@ -20,6 +20,9 @@ skills/macaroon-bakery/scripts/bake.sh --role invoice-only
 # Bake a read-only macaroon
 skills/macaroon-bakery/scripts/bake.sh --role read-only
 
+# Bake a node-ops macaroon (fee management + circular self-pay)
+skills/macaroon-bakery/scripts/bake.sh --role node-ops
+
 # Inspect any macaroon
 skills/macaroon-bakery/scripts/bake.sh --inspect ~/.lnd/data/chain/bitcoin/mainnet/admin.macaroon
 
@@ -65,8 +68,9 @@ with `macaroon:generate` permission (typically admin.macaroon).
 | `pay-only` | Pay invoices, decode invoices, get node info | Create invoices, open channels, see balances |
 | `invoice-only` | Create invoices, lookup invoices, get node info | Pay, open channels, see wallet balance |
 | `read-only` | Get info, balances, list channels/peers/payments | Pay, create invoices, open/close channels |
-| `channel-admin` | All of read-only + open/close channels, connect peers | Pay invoices, create invoices |
+| `channel-admin` | All of read-only + open/close channels, connect peers | Pay invoices, create invoices, set fees |
 | `signer-only` | Sign transactions, derive keys (for remote signer) | Everything else |
+| `node-ops` | Set channel fees (`UpdateChannelPolicy`), circular self-pay for rebalancing (`SendToRouteV2`, `BuildRoute`), query routes, read node/channel state | Open/close channels, pay external invoices, create invoices |
 
 ## Baking Custom Macaroons
 
@@ -109,6 +113,40 @@ skills/macaroon-bakery/scripts/bake.sh --inspect <path-to-macaroon>
 # Inspect the admin macaroon to see full permissions
 skills/macaroon-bakery/scripts/bake.sh --inspect ~/.lnd/data/chain/bitcoin/mainnet/admin.macaroon
 ```
+
+## Node-Ops Macaroon
+
+The `node-ops` role is for automated routing agents that need to tune fees and
+rebalance channels without holding admin-level trust.
+
+**What it can do:**
+- Set channel routing fees (`UpdateChannelPolicy`)
+- Send circular self-payments for rebalancing (`BuildRoute` + `SendToRouteV2`)
+- Query routes for probing (`QueryRoutes`)
+- Read node state (info, balances, channels)
+
+**What it cannot do:**
+- Open or close channels
+- Pay external invoices (`SendPaymentSync` / `SendPaymentV2` are excluded)
+- Create invoices
+- Connect or disconnect peers
+
+```bash
+# Bake a node-ops macaroon (local node)
+skills/macaroon-bakery/scripts/bake.sh --role node-ops
+
+# Bake inside a litd container
+skills/macaroon-bakery/scripts/bake.sh --role node-ops --container litd
+
+# Verify what was baked
+skills/macaroon-bakery/scripts/bake.sh --inspect ~/.lnd/data/chain/bitcoin/testnet/node-ops.macaroon
+```
+
+The key difference from `channel-admin`: node-ops agents can set fees and
+self-pay for rebalancing but cannot open or close channels. The key difference
+from `pay-only`: node-ops agents can manage routing policy but cannot pay
+arbitrary external invoices — `SendToRouteV2` requires you to construct the
+exact route, making accidental external payments unlikely.
 
 ## Signer Macaroon Scoping
 
@@ -172,6 +210,11 @@ skills/lnd/scripts/lncli.sh bakemacaroon --root_key_id 0
 | `uri:/lnrpc.Lightning/ConnectPeer` | Connect to a peer |
 | `uri:/lnrpc.Lightning/OpenChannelSync` | Open a channel |
 | `uri:/lnrpc.Lightning/CloseChannel` | Close a channel |
+| `uri:/lnrpc.Lightning/UpdateChannelPolicy` | Set routing fees for channels |
+| `uri:/lnrpc.Lightning/QueryRoutes` | Query routes between nodes |
+| `uri:/routerrpc.Router/SendToRouteV2` | Send along an explicitly constructed route (circular self-pay) |
+| `uri:/routerrpc.Router/BuildRoute` | Build a route from a list of hops |
+| `uri:/routerrpc.Router/ResetMissionControl` | Reset payment attempt history |
 | `uri:/signrpc.Signer/SignOutputRaw` | Sign a transaction output |
 | `uri:/signrpc.Signer/ComputeInputScript` | Compute input script for signing |
 | `uri:/signrpc.Signer/MuSig2Sign` | MuSig2 signing |
