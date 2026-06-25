@@ -1,0 +1,159 @@
+// Copyright (c) 2025 Lightning Labs
+// Distributed under the MIT license. See LICENSE for details.
+
+package tools
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+// HealthService aggregates node health data into prioritized alerts.
+type HealthService struct {
+	LightningClient lnrpc.LightningClient
+}
+
+// NewHealthService creates a new health service.
+func NewHealthService(client lnrpc.LightningClient) *HealthService {
+	return &HealthService{
+		LightningClient: client,
+	}
+}
+
+// NodeHealthTool returns the MCP tool definition for node health alerts.
+func (s *HealthService) NodeHealthTool() *mcp.Tool {
+	return &mcp.Tool{
+		Name: "lnc_node_health",
+		Description: "Aggregate node health alerts: force-closing channels, " +
+			"peer flap counts, and sync status into a prioritized list",
+		InputSchema: ToolInputSchema{
+			Type:       "object",
+			Properties: map[string]any{},
+		},
+	}
+}
+
+// HandleNodeHealth handles the node health request.
+func (s *HealthService) HandleNodeHealth(ctx context.Context,
+	request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+
+	if s.LightningClient == nil {
+		return newToolResultError(
+			"Not connected to Lightning node. " +
+				"Use lnc_connect first."), nil
+	}
+
+	var alerts []map[string]any
+
+	// --- sync status (from GetInfo) ---
+	info, err := s.LightningClient.GetInfo(ctx, &lnrpc.GetInfoRequest{})
+	if err != nil {
+		return newToolResultError(
+			"Failed to get node info: " + err.Error()), nil
+	}
+
+	if !info.SyncedToChain {
+		alerts = append(alerts, map[string]any{
+			"severity": "critical",
+			"category": "sync",
+			"message":  "Node is NOT synced to chain",
+		})
+	}
+	if !info.SyncedToGraph {
+		alerts = append(alerts, map[string]any{
+			"severity": "warning",
+			"category": "sync",
+			"message":  "Node is NOT synced to graph",
+		})
+	}
+
+	// --- force-closing / waiting-close channels (from PendingChannels) ---
+	pending, err := s.LightningClient.PendingChannels(
+		ctx, &lnrpc.PendingChannelsRequest{},
+	)
+	if err != nil {
+		return newToolResultError(
+			"Failed to get pending channels: " + err.Error()), nil
+	}
+
+	for _, ch := range pending.PendingForceClosingChannels {
+		alerts = append(alerts, map[string]any{
+			"severity":            "critical",
+			"category":            "channel",
+			"message":             "Force-closing channel detected",
+			"channel_point":       ch.Channel.ChannelPoint,
+			"remote_node_pub":     ch.Channel.RemoteNodePub,
+			"limbo_balance_sat":   ch.LimboBalance,
+			"blocks_til_maturity": ch.BlocksTilMaturity,
+			"closing_txid":        ch.ClosingTxid,
+		})
+	}
+
+	for _, ch := range pending.WaitingCloseChannels {
+		alerts = append(alerts, map[string]any{
+			"severity":          "warning",
+			"category":          "channel",
+			"message":           "Channel waiting to close",
+			"channel_point":     ch.Channel.ChannelPoint,
+			"remote_node_pub":   ch.Channel.RemoteNodePub,
+			"limbo_balance_sat": ch.LimboBalance,
+		})
+	}
+
+	// --- peer flap counts (from ListPeers) ---
+	const flapThreshold = int32(10)
+	peers, err := s.LightningClient.ListPeers(
+		ctx, &lnrpc.ListPeersRequest{},
+	)
+	if err != nil {
+		return newToolResultError(
+			"Failed to list peers: " + err.Error()), nil
+	}
+
+	for _, peer := range peers.Peers {
+		if peer.FlapCount >= flapThreshold {
+			alerts = append(alerts, map[string]any{
+				"severity":   "warning",
+				"category":   "peer",
+				"message":    fmt.Sprintf("Peer has high flap count (%d)", peer.FlapCount),
+				"pub_key":    peer.PubKey,
+				"address":    peer.Address,
+				"flap_count": peer.FlapCount,
+			})
+		}
+	}
+
+	// Summarize counts per severity.
+	critical, warning := 0, 0
+	for _, a := range alerts {
+		switch a["severity"] {
+		case "critical":
+			critical++
+		case "warning":
+			warning++
+		}
+	}
+
+	overall := "healthy"
+	if critical > 0 {
+		overall = "critical"
+	} else if warning > 0 {
+		overall = "degraded"
+	}
+
+	return newToolResultJSON(map[string]any{
+		"overall_status":   overall,
+		"alert_count":      len(alerts),
+		"critical_count":   critical,
+		"warning_count":    warning,
+		"alerts":           alerts,
+		"node_id":          info.IdentityPubkey,
+		"alias":            info.Alias,
+		"synced_to_chain":  info.SyncedToChain,
+		"synced_to_graph":  info.SyncedToGraph,
+		"block_height":     info.BlockHeight,
+	}), nil
+}
