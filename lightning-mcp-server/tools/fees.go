@@ -17,6 +17,9 @@ type FeeService struct {
 	LightningClient lnrpc.LightningClient
 }
 
+// feePageSize is the maximum number of forwarding events fetched per page.
+const feePageSize uint32 = 50000
+
 // NewFeeService creates a new FeeService.
 func NewFeeService(client lnrpc.LightningClient) *FeeService {
 	return &FeeService{LightningClient: client}
@@ -81,17 +84,42 @@ func (s *FeeService) HandleProposeFees(ctx context.Context,
 		maxFeePPM = 5000
 	}
 
-	startTime := uint64(time.Now().Add(-time.Duration(days) * 24 * time.Hour).Unix())
-
-	history, err := s.LightningClient.ForwardingHistory(
-		ctx, &lnrpc.ForwardingHistoryRequest{
-			StartTime:    startTime,
-			NumMaxEvents: 50000,
-		},
-	)
-	if err != nil {
+	// Bug fix: reject inverted bounds before making any API calls.
+	if minFeePPM > maxFeePPM {
 		return newToolResultError(
-			"Failed to fetch forwarding history: " + err.Error()), nil
+			"min_fee_ppm must not exceed max_fee_ppm"), nil
+	}
+
+	// Bug fix: convert fractional days to nanoseconds correctly so that
+	// values like 1.5 produce the right duration rather than truncating to
+	// the nearest integer day.
+	startTime := uint64(
+		time.Now().Add(
+			-time.Duration(days * 24 * float64(time.Hour)),
+		).Unix(),
+	)
+
+	// Bug fix: paginate ForwardingHistory so nodes with more than 50 000
+	// events in the window are not silently truncated.
+	var allEvents []*lnrpc.ForwardingEvent
+	var offset uint32
+	for {
+		batch, err := s.LightningClient.ForwardingHistory(
+			ctx, &lnrpc.ForwardingHistoryRequest{
+				StartTime:    startTime,
+				NumMaxEvents: feePageSize,
+				IndexOffset:  offset,
+			},
+		)
+		if err != nil {
+			return newToolResultError(
+				"Failed to fetch forwarding history: " + err.Error()), nil
+		}
+		allEvents = append(allEvents, batch.ForwardingEvents...)
+		if uint32(len(batch.ForwardingEvents)) < feePageSize {
+			break
+		}
+		offset = batch.LastOffsetIndex + 1
 	}
 
 	channels, err := s.LightningClient.ListChannels(
@@ -108,7 +136,7 @@ func (s *FeeService) HandleProposeFees(ctx context.Context,
 		feesEarnedMs int64
 	}
 	stats := make(map[uint64]*chanStats)
-	for _, ev := range history.ForwardingEvents {
+	for _, ev := range allEvents {
 		if _, ok := stats[ev.ChanIdOut]; !ok {
 			stats[ev.ChanIdOut] = &chanStats{}
 		}
@@ -134,16 +162,16 @@ func (s *FeeService) HandleProposeFees(ctx context.Context,
 		proposedPPM := proposeFee(localRatio, forwards, minFeePPM, maxFeePPM)
 
 		entry := map[string]any{
-			"chan_id":          strconv.FormatUint(ch.ChanId, 10),
-			"remote_pubkey":   ch.RemotePubkey,
-			"channel_point":   ch.ChannelPoint,
-			"capacity_sat":    ch.Capacity,
-			"local_balance":   ch.LocalBalance,
-			"remote_balance":  ch.RemoteBalance,
-			"local_ratio":     round2(localRatio),
-			"forwards_out":    forwards,
+			"chan_id":           strconv.FormatUint(ch.ChanId, 10),
+			"remote_pubkey":    ch.RemotePubkey,
+			"channel_point":    ch.ChannelPoint,
+			"capacity_sat":     ch.Capacity,
+			"local_balance":    ch.LocalBalance,
+			"remote_balance":   ch.RemoteBalance,
+			"local_ratio":      round2(localRatio),
+			"forwards_out":     forwards,
 			"proposed_fee_ppm": proposedPPM,
-			"reason":          feeReason(localRatio, forwards),
+			"reason":           feeReason(localRatio, forwards),
 		}
 		if st != nil {
 			entry["amt_routed_msat"] = st.amtOutMsat
@@ -153,10 +181,10 @@ func (s *FeeService) HandleProposeFees(ctx context.Context,
 	}
 
 	return newToolResultJSON(map[string]any{
-		"lookback_days":   int(days),
-		"total_forwards":  len(history.ForwardingEvents),
-		"proposals":       proposals,
-		"note":            "Proposals are suggestions only. Apply with UpdateChannelPolicy after review.",
+		"lookback_days":  int(days),
+		"total_forwards": len(allEvents),
+		"proposals":      proposals,
+		"note":           "Proposals are suggestions only. Apply with UpdateChannelPolicy after review.",
 	}), nil
 }
 
@@ -172,8 +200,9 @@ func proposeFee(localRatio float64, forwards int64, minPPM, maxPPM float64) int6
 	var ppm float64
 	switch {
 	case localRatio < 0.2:
-		// Depleted — push fee toward max to slow down outflow.
-		ppm = maxPPM * 0.80
+		// Bug fix: use range-relative formula (same pattern as all other
+		// branches) so the result respects minPPM and scales with the range.
+		ppm = minPPM + (maxPPM-minPPM)*0.90
 	case localRatio > 0.8:
 		// Over-full — lower fee to encourage outflow and rebalancing.
 		ppm = minPPM + (maxPPM-minPPM)*0.10
