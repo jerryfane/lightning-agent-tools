@@ -1,0 +1,29 @@
+# node-ops-daemon example configuration
+# Copy to ~/.node-ops/config.toml and adjust values.
+
+[limits]
+# Maximum satoshis the daemon may rebalance per UTC calendar day.
+daily_rebalance_budget_sat = 1_000_000
+
+# Largest single fee change (absolute value, in ppm) that can be auto-executed.
+max_fee_ppm_delta = 100
+
+# Minimum time between successive operations on the same channel (Go duration string).
+per_channel_cooldown = "1h"
+
+# Fee rate ceiling (ppm) accepted for rebalance routes.
+rebalance_max_fee_ppm = 500
+
+[approval]
+# Changes with |delta_ppm| <= this value are auto-executed (when require_approval = false).
+auto_execute_below_ppm_delta = 20
+
+# When true, every action is queued for human review regardless of size.
+require_approval = false
+
+[storage]
+# Path to the append-only SQLite audit ledger.
+ledger = "~/.node-ops/ledger.db"
+
+# Creating this file halts all daemon execution immediately.
+killswitch_file = "~/.node-ops/KILL"
