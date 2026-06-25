@@ -35,6 +35,7 @@ type Manager struct {
 	onchainService    *tools.OnChainService
 	peerService       *tools.PeerService
 	nodeService       *tools.NodeService
+	rebalanceService  *tools.RebalanceService
 }
 
 // NewManager creates a new service manager for read-only operations.
@@ -60,6 +61,7 @@ func (m *Manager) InitializeServices() {
 	m.onchainService = tools.NewOnChainService(nil)
 	m.peerService = tools.NewPeerService(nil)
 	m.nodeService = tools.NewNodeService(nil)
+	m.rebalanceService = tools.NewRebalanceService(nil)
 
 	m.logger.Info("Read-only services initialized successfully")
 }
@@ -128,6 +130,10 @@ func (m *Manager) RegisterTools(mcpServer interfaces.MCPServer) error {
 	register(m.nodeService.GetInfoTool(),
 		m.nodeService.HandleGetInfo)
 
+	// Rebalance tools - read-only proposal only, no funds movement.
+	register(m.rebalanceService.ProposeRebalanceTool(),
+		m.rebalanceService.HandleProposeRebalance)
+
 	m.logger.Info("Read-only MCP tools registered",
 		zap.Int("total_tools", registrations))
 	return nil
@@ -149,6 +155,7 @@ func (m *Manager) onLNCConnectionEstablished(conn *grpc.ClientConn) {
 	m.onchainService.LightningClient = m.lightningClient
 	m.peerService.LightningClient = m.lightningClient
 	m.nodeService.LightningClient = m.lightningClient
+	m.rebalanceService.LightningClient = m.lightningClient
 
 	logger.Info("All read-only services updated with new connection")
 }
