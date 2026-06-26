@@ -6,6 +6,7 @@ lightning-mcp-server/.env
 lightning-mcp-server/lightning-mcp-server
 lightning-mcp-server/coverage.out
 lightning-mcp-server/coverage.html
+node-ops-daemon/node-ops-daemon
 
 # npm artifacts
 node_modules/

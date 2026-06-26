@@ -19,6 +19,8 @@ build: #? Build the node-ops-daemon binary
 	@$(call print, "Building node-ops-daemon.")
 	$(GOBUILD) -o node-ops-daemon .
 
+test: unit #? Alias for unit tests
+
 unit: #? Run unit tests
 	@$(call print, "Running unit tests.")
 	$(GOLIST) | xargs -L 1 env $(GOTEST) -timeout 60s
