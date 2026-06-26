@@ -31,6 +31,10 @@ func newTestDaemonWithExecutor(t *testing.T, mutate func(*config.Config),
 	t.Helper()
 
 	dir := t.TempDir()
+	storeDir := filepath.Join(dir, "node-ops")
+	if err := os.Mkdir(storeDir, 0700); err != nil {
+		t.Fatalf("Mkdir store dir: %v", err)
+	}
 	cfg := &config.Config{
 		Limits: config.Limits{
 			DailyRebalanceBudgetSat: 1_000,
@@ -43,8 +47,8 @@ func newTestDaemonWithExecutor(t *testing.T, mutate func(*config.Config),
 			RequireApproval:          true,
 		},
 		Storage: config.Storage{
-			LedgerPath:     filepath.Join(dir, "ledger.db"),
-			KillswitchFile: filepath.Join(dir, "STOP"),
+			LedgerPath:     filepath.Join(storeDir, "ledger.db"),
+			KillswitchFile: filepath.Join(storeDir, "STOP"),
 		},
 	}
 	if mutate != nil {
@@ -228,6 +232,33 @@ func TestDispatchRechecksKillSwitchBeforeExecution(t *testing.T) {
 	}
 }
 
+func TestDispatchRechecksKillSwitchBeforeQueueing(t *testing.T) {
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{
+		1: {BaseMsat: 1_000, FeePpm: 100},
+	})
+	d := newTestDaemonWithExecutor(t, nil, fake)
+
+	var once sync.Once
+	fake.onCurrent = func() {
+		once.Do(func() {
+			if err := os.WriteFile(d.cfg.Storage.KillswitchFile, []byte("stop"), 0600); err != nil {
+				t.Fatalf("write killswitch: %v", err)
+			}
+		})
+	}
+
+	resp := d.dispatch(Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"fee_ppm":110}`),
+	})
+	if resp.Status != "error" || !strings.Contains(resp.Reason, "killswitch") {
+		t.Fatalf("expected killswitch rejection, got %+v", resp)
+	}
+	if pending := d.queue.ListPending(); len(pending) != 0 {
+		t.Fatalf("request queued despite kill-switch: %+v", pending)
+	}
+}
+
 func TestRunRefusesActiveSocket(t *testing.T) {
 	d := newTestDaemon(t, nil)
 	sockPath := filepath.Join(t.TempDir(), "daemon.sock")
@@ -266,7 +297,7 @@ func TestPrepareSocketDirSecuresExistingDirectory(t *testing.T) {
 	}
 }
 
-func TestNewSecuresExistingLedgerDirectory(t *testing.T) {
+func TestNewRejectsUnsafeExistingLedgerDirectory(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "ledger")
 	if err := os.Mkdir(dir, 0777); err != nil {
 		t.Fatalf("Mkdir: %v", err)
@@ -275,18 +306,20 @@ func TestNewSecuresExistingLedgerDirectory(t *testing.T) {
 		t.Fatalf("Chmod: %v", err)
 	}
 
-	d := newTestDaemon(t, func(cfg *config.Config) {
-		cfg.Storage.LedgerPath = filepath.Join(dir, "ledger.db")
-	})
-	if d == nil {
-		t.Fatal("expected daemon")
+	cfg := config.Defaults()
+	cfg.Storage.LedgerPath = filepath.Join(dir, "ledger.db")
+	cfg.Storage.KillswitchFile = filepath.Join(t.TempDir(), "STOP")
+	d, err := New(cfg, newFakeExecutor(nil))
+	if err == nil {
+		d.Close()
+		t.Fatal("expected unsafe ledger dir rejection")
 	}
 	info, err := os.Stat(dir)
 	if err != nil {
 		t.Fatalf("Stat: %v", err)
 	}
-	if info.Mode().Perm()&0077 != 0 {
-		t.Fatalf("ledger dir still allows group/other access: %03o",
+	if info.Mode().Perm()&0077 == 0 {
+		t.Fatalf("ledger dir was chmodded despite rejection: %03o",
 			info.Mode().Perm())
 	}
 }

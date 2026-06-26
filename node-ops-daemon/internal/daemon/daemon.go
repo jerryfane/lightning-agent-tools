@@ -264,6 +264,18 @@ func (d *Daemon) handleFeeSet(reqID string, raw json.RawMessage) Response {
 		return d.executeFeeSet(reqID, raw, p)
 	}
 
+	if killswitch.Active(d.cfg.Storage.KillswitchFile) {
+		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
+			"killswitch active"); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{
+			Status:    "error",
+			RequestID: reqID,
+			Reason:    "killswitch active: all execution is halted",
+		}
+	}
 	return d.queueFeeSet(reqID, raw)
 }
 
@@ -298,14 +310,21 @@ func parseFeeSetParams(raw json.RawMessage) (feeSetParams, error) {
 }
 
 func prepareLedgerDir(dir string) error {
-	return preparePrivateDir("ledger", dir)
+	return preparePrivateDir("ledger", dir, false)
 }
 
 func prepareSocketDir(dir string) error {
-	return preparePrivateDir("socket", dir)
+	return preparePrivateDir("socket", dir, true)
 }
 
-func preparePrivateDir(kind, dir string) error {
+func preparePrivateDir(kind, dir string, fixExistingPerms bool) error {
+	existed := true
+	if _, err := os.Lstat(dir); err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("stat %s dir %s: %w", kind, dir, err)
+		}
+		existed = false
+	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("create %s dir: %w", kind, err)
 	}
@@ -324,6 +343,9 @@ func preparePrivateDir(kind, dir string) error {
 	}
 	if info.Mode().Perm()&0077 == 0 {
 		return nil
+	}
+	if existed && !fixExistingPerms {
+		return fmt.Errorf("%s dir %s has unsafe permissions %03o", kind, dir, info.Mode().Perm())
 	}
 	if err := os.Chmod(dir, 0700); err != nil {
 		return fmt.Errorf("secure %s dir %s: %w", kind, dir, err)
