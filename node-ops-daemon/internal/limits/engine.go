@@ -13,6 +13,8 @@ import (
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/config"
 )
 
+const maxInt64 = int64(1<<63 - 1)
+
 // Engine enforces per-day rebalance budgets, per-ppm-delta caps, per-channel
 // cooldowns, and maximum rebalance fee rates.
 type Engine struct {
@@ -68,7 +70,7 @@ func (e *Engine) CheckRebalance(chanID uint64, amtSat, feePpm int64) error {
 	if feePpm > e.cfg.RebalanceMaxFeePpm {
 		return fmt.Errorf("fee_ppm %d exceeds rebalance_max_fee_ppm %d", feePpm, e.cfg.RebalanceMaxFeePpm)
 	}
-	if e.dailySpentSat+amtSat > e.cfg.DailyRebalanceBudgetSat {
+	if amtSat > e.remainingDailyBudgetLocked() {
 		return fmt.Errorf("rebalance %d sat would exceed daily_rebalance_budget_sat %d (spent %d)",
 			amtSat, e.cfg.DailyRebalanceBudgetSat, e.dailySpentSat)
 	}
@@ -109,8 +111,19 @@ func (e *Engine) RecordRebalance(chanID uint64, amtSat int64) {
 		return
 	}
 	e.resetDailyIfNeeded()
-	e.dailySpentSat += amtSat
+	if amtSat > maxInt64-e.dailySpentSat {
+		e.dailySpentSat = maxInt64
+	} else {
+		e.dailySpentSat += amtSat
+	}
 	e.channelLastOp[chanID] = time.Now()
+}
+
+func (e *Engine) remainingDailyBudgetLocked() int64 {
+	if e.dailySpentSat >= e.cfg.DailyRebalanceBudgetSat {
+		return 0
+	}
+	return e.cfg.DailyRebalanceBudgetSat - e.dailySpentSat
 }
 
 // resetDailyIfNeeded resets the daily counter when the UTC date has changed.

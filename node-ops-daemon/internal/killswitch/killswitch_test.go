@@ -44,6 +44,22 @@ func TestInactiveAfterRemoval(t *testing.T) {
 	}
 }
 
+func TestActiveWhenDanglingSymlinkExists(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink setup differs on Windows")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "STOP")
+	if err := os.Symlink(filepath.Join(dir, "missing"), path); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	if !killswitch.Active(path) {
+		t.Error("expected dangling symlink presence to fail closed as active")
+	}
+}
+
 func TestActiveWhenStatErrors(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("chmod permission behavior differs on Windows")

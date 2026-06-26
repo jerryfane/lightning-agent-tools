@@ -10,6 +10,8 @@ import (
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/limits"
 )
 
+const maxInt64 = int64(1<<63 - 1)
+
 func newEngine(t *testing.T, cfg config.Limits) *limits.Engine {
 	t.Helper()
 	eng, err := limits.New(cfg)
@@ -75,6 +77,25 @@ func TestCheckRebalance_DailyBudget(t *testing.T) {
 	}
 	if err := eng.CheckRebalance(2, 500, 100); err != nil {
 		t.Errorf("exact remaining budget should be allowed: %v", err)
+	}
+}
+
+func TestCheckRebalance_DailyBudgetOverflow(t *testing.T) {
+	eng := newEngine(t, config.Limits{
+		DailyRebalanceBudgetSat: 1000,
+		MaxFeePpmDelta:          1000,
+		PerChannelCooldown:      "0s",
+		RebalanceMaxFeePpm:      1000,
+	})
+
+	eng.RecordRebalance(1, 1)
+	if err := eng.CheckRebalance(2, maxInt64, 100); err == nil {
+		t.Error("expected near-max amount to exceed remaining budget")
+	}
+
+	eng.RecordRebalance(1, maxInt64)
+	if err := eng.CheckRebalance(2, 1, 100); err == nil {
+		t.Error("expected saturated daily spent counter to reject more budget")
 	}
 }
 

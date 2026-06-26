@@ -11,6 +11,6 @@ import "os"
 // execution should be halted. Only a clean missing-file result is inactive;
 // any other stat error fails closed.
 func Active(path string) bool {
-	_, err := os.Stat(path)
+	_, err := os.Lstat(path)
 	return err == nil || !os.IsNotExist(err)
 }
