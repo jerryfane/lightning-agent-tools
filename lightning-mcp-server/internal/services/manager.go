@@ -28,16 +28,17 @@ type Manager struct {
 	lightningClient lnrpc.LightningClient
 
 	// Services - read-only operations only.
-	connectionService *tools.ConnectionService
-	invoiceService    *tools.InvoiceService
-	channelService    *tools.ChannelService
-	paymentService    *tools.PaymentService
-	onchainService    *tools.OnChainService
-	peerService       *tools.PeerService
-	nodeService       *tools.NodeService
-	healthService     *tools.HealthService
-	rebalanceService  *tools.RebalanceService
-	feeService        *tools.FeeService
+	connectionService     *tools.ConnectionService
+	invoiceService        *tools.InvoiceService
+	channelService        *tools.ChannelService
+	channelActionsService *tools.ChannelActionsService
+	paymentService        *tools.PaymentService
+	onchainService        *tools.OnChainService
+	peerService           *tools.PeerService
+	nodeService           *tools.NodeService
+	healthService         *tools.HealthService
+	rebalanceService      *tools.RebalanceService
+	feeService            *tools.FeeService
 }
 
 // NewManager creates a new service manager for read-only operations.
@@ -59,6 +60,7 @@ func (m *Manager) InitializeServices() {
 	// Initialize all read-only services with nil clients.
 	m.invoiceService = tools.NewInvoiceService(nil)
 	m.channelService = tools.NewChannelService(nil)
+	m.channelActionsService = tools.NewChannelActionsService(nil)
 	m.paymentService = tools.NewPaymentService(nil)
 	m.onchainService = tools.NewOnChainService(nil)
 	m.peerService = tools.NewPeerService(nil)
@@ -105,6 +107,8 @@ func (m *Manager) RegisterTools(mcpServer interfaces.MCPServer) error {
 		m.channelService.HandleListChannels)
 	register(m.channelService.PendingChannelsTool(),
 		m.channelService.HandlePendingChannels)
+	register(m.channelActionsService.ProposeChannelActionsTool(),
+		m.channelActionsService.HandleProposeChannelActions)
 
 	// Payment tools - read-only operations.
 	register(m.paymentService.ListPaymentsTool(),
@@ -163,6 +167,7 @@ func (m *Manager) onLNCConnectionEstablished(conn *grpc.ClientConn) {
 	// Update existing read-only services with new connection.
 	m.invoiceService.LightningClient = m.lightningClient
 	m.channelService.LightningClient = m.lightningClient
+	m.channelActionsService.LightningClient = m.lightningClient
 	m.paymentService.LightningClient = m.lightningClient
 	m.onchainService.LightningClient = m.lightningClient
 	m.peerService.LightningClient = m.lightningClient
