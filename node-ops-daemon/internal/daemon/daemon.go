@@ -1,0 +1,536 @@
+// Copyright (c) 2025 Lightning Labs
+// Distributed under the MIT license. See LICENSE for details.
+
+// Package daemon implements the node-ops-daemon Unix-socket server.
+//
+// Wire format: each message is a 4-byte big-endian length followed by a
+// JSON body. Requests carry {action, params}; responses carry
+// {status, request_id, result?, reason?}.
+package daemon
+
+import (
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/config"
+	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/executor"
+	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/killswitch"
+	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/ledger"
+	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/limits"
+	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/queue"
+)
+
+const maxMessageBytes = 1 << 20 // 1 MiB
+
+// Request is the incoming message from a client.
+type Request struct {
+	Action string          `json:"action"`
+	Params json.RawMessage `json:"params"`
+}
+
+// Response is the outgoing reply to a client.
+type Response struct {
+	Status    string      `json:"status"`
+	RequestID string      `json:"request_id"`
+	Result    interface{} `json:"result,omitempty"`
+	Reason    string      `json:"reason,omitempty"`
+}
+
+// Daemon is the long-lived node operations daemon.
+type Daemon struct {
+	cfg      *config.Config
+	limits   *limits.Engine
+	ledger   *ledger.Ledger
+	queue    *queue.Queue
+	executor executor.NodeExecutor
+	execMu   sync.Mutex
+}
+
+// New creates a Daemon, initialises the limits engine and opens the ledger.
+func New(cfg *config.Config, exec executor.NodeExecutor) (*Daemon, error) {
+	eng, err := limits.New(cfg.Limits)
+	if err != nil {
+		return nil, fmt.Errorf("limits engine: %w", err)
+	}
+	if err := prepareLedgerDir(filepath.Dir(cfg.Storage.LedgerPath)); err != nil {
+		return nil, err
+	}
+	l, err := ledger.Open(cfg.Storage.LedgerPath)
+	if err != nil {
+		return nil, fmt.Errorf("ledger: %w", err)
+	}
+	return &Daemon{
+		cfg:      cfg,
+		limits:   eng,
+		ledger:   l,
+		queue:    queue.New(),
+		executor: exec,
+	}, nil
+}
+
+// Close releases the ledger handle.
+func (d *Daemon) Close() error {
+	return d.ledger.Close()
+}
+
+// Run listens on sockPath (Unix domain socket, mode 0600) and handles clients
+// until ctx is cancelled.
+func (d *Daemon) Run(ctx context.Context, sockPath string) error {
+	if err := prepareSocketDir(filepath.Dir(sockPath)); err != nil {
+		return err
+	}
+	if err := removeStaleSocket(sockPath); err != nil {
+		return err
+	}
+
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", sockPath, err)
+	}
+	if err := os.Chmod(sockPath, 0600); err != nil {
+		ln.Close()
+		return fmt.Errorf("chmod socket: %w", err)
+	}
+
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				return fmt.Errorf("accept: %w", err)
+			}
+		}
+		go d.handleConn(conn)
+	}
+}
+
+func (d *Daemon) handleConn(conn net.Conn) {
+	defer conn.Close()
+	for {
+		req, err := readMessage(conn)
+		if err != nil {
+			if err != io.EOF {
+				_ = writeMessage(conn, Response{
+					Status: "error",
+					Reason: fmt.Sprintf("read error: %v", err),
+				})
+			}
+			return
+		}
+		resp := d.dispatch(req)
+		if err := writeMessage(conn, resp); err != nil {
+			return
+		}
+	}
+}
+
+// dispatch routes a request to the appropriate handler. Write handlers enforce
+// the kill-switch before execution; read-only status/inspection remains visible.
+func (d *Daemon) dispatch(req Request) Response {
+	reqID := uuid.New().String()
+
+	switch req.Action {
+	case "execute_fee_set":
+		return d.handleFeeSet(reqID, req.Params)
+	case "list_pending":
+		return d.handleListPending(reqID)
+	case "status":
+		if err := d.record(reqID, req.Action, req.Params, "ok", ""); err != nil {
+			return ledgerFailure(reqID, err)
+		}
+		return Response{
+			Status:    "ok",
+			RequestID: reqID,
+			Result:    d.statusResult(),
+		}
+	default:
+		reason := fmt.Sprintf("unknown action: %q", req.Action)
+		if err := d.record(reqID, req.Action, req.Params, "rejected", reason); err != nil {
+			return ledgerFailure(reqID, err)
+		}
+		return Response{
+			Status:    "error",
+			RequestID: reqID,
+			Reason:    reason,
+		}
+	}
+}
+
+func (d *Daemon) record(reqID, action string, params json.RawMessage,
+	status, reason string) error {
+
+	return d.ledger.Record(ledger.Entry{
+		RequestID: reqID,
+		Action:    action,
+		Params:    string(params),
+		Status:    status,
+		Reason:    reason,
+		CreatedAt: time.Now(),
+	})
+}
+
+func ledgerFailure(reqID string, err error) Response {
+	return Response{
+		Status:    "error",
+		RequestID: reqID,
+		Reason:    "audit ledger unavailable: " + err.Error(),
+	}
+}
+
+func (d *Daemon) statusResult() map[string]string {
+	if killswitch.Active(d.cfg.Storage.KillswitchFile) {
+		return map[string]string{"state": "stopped", "killswitch": "active"}
+	}
+	return map[string]string{"state": "running", "killswitch": "inactive"}
+}
+
+func (d *Daemon) rejectIfKillSwitchActive(reqID, action string,
+	raw json.RawMessage) (Response, bool) {
+
+	if !killswitch.Active(d.cfg.Storage.KillswitchFile) {
+		return Response{}, false
+	}
+	if recErr := d.record(reqID, action, raw, "rejected",
+		"killswitch active"); recErr != nil {
+
+		return ledgerFailure(reqID, recErr), true
+	}
+	return Response{
+		Status:    "error",
+		RequestID: reqID,
+		Reason:    "killswitch active: all execution is halted",
+	}, true
+}
+
+// feeSetParams are the parameters for the execute_fee_set action.
+type feeSetParams struct {
+	ChanID   uint64 `json:"chan_id"`
+	BaseMsat int64  `json:"base_msat"`
+	FeePpm   int64  `json:"fee_ppm"`
+}
+
+type rawFeeSetParams struct {
+	ChanID   *uint64 `json:"chan_id"`
+	BaseMsat *int64  `json:"base_msat"`
+	FeePpm   *int64  `json:"fee_ppm"`
+}
+
+type feeSetPolicyDelta struct {
+	ppmDelta    int64
+	baseChanged bool
+}
+
+func (d *Daemon) handleFeeSet(reqID string, raw json.RawMessage) Response {
+	if resp, stopped := d.rejectIfKillSwitchActive(reqID, "execute_fee_set",
+		raw); stopped {
+
+		return resp
+	}
+
+	p, err := parseFeeSetParams(raw)
+	if err != nil {
+		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
+			"invalid params: "+err.Error()); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: "invalid params: " + err.Error()}
+	}
+
+	delta, err := d.feeSetPolicyDelta(context.Background(), p)
+	if err != nil {
+		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
+			err.Error()); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
+	}
+	if err := d.limits.CheckFeeDelta(delta.ppmDelta); err != nil {
+		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
+			err.Error()); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
+	}
+
+	if !d.needsApproval(delta) {
+		return d.executeFeeSet(reqID, raw, p)
+	}
+
+	if resp, stopped := d.rejectIfKillSwitchActive(reqID, "execute_fee_set",
+		raw); stopped {
+
+		return resp
+	}
+	return d.queueFeeSet(reqID, raw)
+}
+
+func parseFeeSetParams(raw json.RawMessage) (feeSetParams, error) {
+	var rawParams rawFeeSetParams
+	if err := json.Unmarshal(raw, &rawParams); err != nil {
+		return feeSetParams{}, err
+	}
+	if rawParams.ChanID == nil {
+		return feeSetParams{}, fmt.Errorf("missing chan_id")
+	}
+	if rawParams.BaseMsat == nil {
+		return feeSetParams{}, fmt.Errorf("missing base_msat")
+	}
+	if rawParams.FeePpm == nil {
+		return feeSetParams{}, fmt.Errorf("missing fee_ppm")
+	}
+	if *rawParams.ChanID == 0 {
+		return feeSetParams{}, fmt.Errorf("chan_id must be non-zero")
+	}
+	if *rawParams.BaseMsat < 0 {
+		return feeSetParams{}, fmt.Errorf("base_msat must be non-negative")
+	}
+	if *rawParams.FeePpm < 0 {
+		return feeSetParams{}, fmt.Errorf("fee_ppm must be non-negative")
+	}
+	return feeSetParams{
+		ChanID:   *rawParams.ChanID,
+		BaseMsat: *rawParams.BaseMsat,
+		FeePpm:   *rawParams.FeePpm,
+	}, nil
+}
+
+func prepareLedgerDir(dir string) error {
+	return preparePrivateDir("ledger", dir, false)
+}
+
+func prepareSocketDir(dir string) error {
+	return preparePrivateDir("socket", dir, true)
+}
+
+func preparePrivateDir(kind, dir string, fixExistingPerms bool) error {
+	existed := true
+	if _, err := os.Lstat(dir); err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("stat %s dir %s: %w", kind, dir, err)
+		}
+		existed = false
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("create %s dir: %w", kind, err)
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("stat %s dir %s: %w", kind, dir, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s dir %s must not be a symlink", kind, dir)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s dir %s is not a directory", kind, dir)
+	}
+	if err := checkPrivateDirOwner(kind, dir, info); err != nil {
+		return err
+	}
+	if info.Mode().Perm()&0077 == 0 {
+		return nil
+	}
+	if existed && !fixExistingPerms {
+		return fmt.Errorf("%s dir %s has unsafe permissions %03o", kind, dir, info.Mode().Perm())
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return fmt.Errorf("secure %s dir %s: %w", kind, dir, err)
+	}
+	info, err = os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("stat %s dir %s: %w", kind, dir, err)
+	}
+	if info.Mode().Perm()&0077 != 0 {
+		return fmt.Errorf("%s dir %s has unsafe permissions %03o", kind, dir, info.Mode().Perm())
+	}
+	return nil
+}
+
+func removeStaleSocket(sockPath string) error {
+	info, err := os.Lstat(sockPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat socket %s: %w", sockPath, err)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("refusing to remove non-socket path %s (mode %s)",
+			sockPath, info.Mode())
+	}
+	conn, err := net.DialTimeout("unix", sockPath, time.Second)
+	if err == nil {
+		_ = conn.Close()
+		return fmt.Errorf("daemon socket already active at %s", sockPath)
+	}
+	if err := os.Remove(sockPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove stale socket %s: %w", sockPath, err)
+	}
+	return nil
+}
+
+func (d *Daemon) feeSetPolicyDelta(ctx context.Context,
+	p feeSetParams) (feeSetPolicyDelta, error) {
+
+	current, err := d.executor.CurrentFeePolicy(ctx, p.ChanID)
+	if err != nil {
+		return feeSetPolicyDelta{}, fmt.Errorf("current fee lookup failed: %w", err)
+	}
+	return feeSetPolicyDelta{
+		ppmDelta:    p.FeePpm - current.FeePpm,
+		baseChanged: p.BaseMsat != current.BaseMsat,
+	}, nil
+}
+
+func (d *Daemon) needsApproval(delta feeSetPolicyDelta) bool {
+	ppmDelta := delta.ppmDelta
+	if ppmDelta < 0 {
+		ppmDelta = -ppmDelta
+	}
+	return d.cfg.Approval.RequireApproval || delta.baseChanged ||
+		ppmDelta > d.cfg.Approval.AutoExecuteBelowPpmDelta
+}
+
+func (d *Daemon) executeFeeSet(reqID string, raw json.RawMessage,
+	p feeSetParams) Response {
+
+	d.execMu.Lock()
+	defer d.execMu.Unlock()
+
+	delta, err := d.feeSetPolicyDelta(context.Background(), p)
+	if err != nil {
+		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
+			err.Error()); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
+	}
+	if err := d.limits.CheckFeeDelta(delta.ppmDelta); err != nil {
+		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
+			err.Error()); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
+	}
+	if d.needsApproval(delta) {
+		if resp, stopped := d.rejectIfKillSwitchActive(reqID, "execute_fee_set",
+			raw); stopped {
+
+			return resp
+		}
+		return d.queueFeeSet(reqID, raw)
+	}
+	if err := d.limits.CheckChannelCooldown(p.ChanID); err != nil {
+		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
+			err.Error()); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
+	}
+	if resp, stopped := d.rejectIfKillSwitchActive(reqID, "execute_fee_set",
+		raw); stopped {
+
+		return resp
+	}
+	if err := d.record(reqID, "execute_fee_set", raw, "accepted", ""); err != nil {
+		return ledgerFailure(reqID, err)
+	}
+	if err := d.executor.ExecuteFeeSet(context.Background(), executor.FeeSetRequest{
+		ChanID: p.ChanID, BaseMsat: p.BaseMsat, FeePpm: p.FeePpm,
+	}); err != nil {
+		if recErr := d.record(reqID, "execute_fee_set", raw, "failed",
+			err.Error()); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
+	}
+	d.limits.RecordChannelOperation(p.ChanID)
+	if err := d.record(reqID, "execute_fee_set", raw, "executed", ""); err != nil {
+		return ledgerFailure(reqID, err)
+	}
+	return Response{Status: "ok", RequestID: reqID,
+		Result: map[string]interface{}{"executed": true, "chan_id": p.ChanID}}
+}
+
+func (d *Daemon) queueFeeSet(reqID string, raw json.RawMessage) Response {
+	if err := d.record(reqID, "execute_fee_set", raw, "pending", ""); err != nil {
+		return ledgerFailure(reqID, err)
+	}
+	d.queue.Enqueue(queue.Item{
+		RequestID: reqID, Action: "execute_fee_set",
+		Params: string(raw), CreatedAt: time.Now(),
+	})
+	return Response{
+		Status: "pending", RequestID: reqID,
+		Result: map[string]interface{}{"queued": true, "request_id": reqID},
+	}
+}
+
+func (d *Daemon) handleListPending(reqID string) Response {
+	items := d.queue.ListPending()
+	if items == nil {
+		items = []queue.Item{}
+	}
+	if err := d.record(reqID, "list_pending", nil, "ok", ""); err != nil {
+		return ledgerFailure(reqID, err)
+	}
+	return Response{Status: "ok", RequestID: reqID, Result: items}
+}
+
+// readMessage reads one length-prefixed JSON message from r.
+func readMessage(r io.Reader) (Request, error) {
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+		return Request{}, err
+	}
+	length := binary.BigEndian.Uint32(lenBuf[:])
+	if length > maxMessageBytes {
+		return Request{}, fmt.Errorf("message too large: %d bytes", length)
+	}
+	body := make([]byte, length)
+	if _, err := io.ReadFull(r, body); err != nil {
+		return Request{}, err
+	}
+	var req Request
+	if err := json.Unmarshal(body, &req); err != nil {
+		return Request{}, fmt.Errorf("decode request: %w", err)
+	}
+	return req, nil
+}
+
+// writeMessage encodes resp as length-prefixed JSON and writes it to w.
+func writeMessage(w io.Writer, resp Response) error {
+	body, err := json.Marshal(resp)
+	if err != nil {
+		return err
+	}
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(body)))
+	if _, err := w.Write(lenBuf[:]); err != nil {
+		return err
+	}
+	_, err = w.Write(body)
+	return err
+}
