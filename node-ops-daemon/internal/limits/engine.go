@@ -30,6 +30,9 @@ func New(cfg config.Limits) (*Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("per_channel_cooldown %q: %w", cfg.PerChannelCooldown, err)
 	}
+	if d < 0 {
+		return nil, fmt.Errorf("per_channel_cooldown %q must be non-negative", cfg.PerChannelCooldown)
+	}
 	return &Engine{
 		cfg:           cfg,
 		cooldown:      d,

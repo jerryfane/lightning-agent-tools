@@ -5,11 +5,18 @@
 // perform write operations on an LND node.
 //
 // The concrete LND/macaroon implementation is deferred to issue #9. This
-// package provides only the interface and a no-op stub so the rest of the
-// daemon can compile and be tested without live LND dependencies.
+// package provides only the interface and a fail-closed stub so the rest of the
+// daemon can compile without live LND dependencies.
 package executor
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrNotImplemented is returned by the fail-closed stub until issue #9 wires
+// real LND RPCs.
+var ErrNotImplemented = errors.New("lnd executor not implemented")
 
 // FeeSetRequest describes a channel policy update.
 type FeeSetRequest struct {
@@ -37,16 +44,16 @@ type NodeExecutor interface {
 	ExecuteFeeSet(ctx context.Context, req FeeSetRequest) error
 }
 
-// StubExecutor is a no-op implementation used until issue #9 wires real RPCs.
-// It succeeds silently for all requests.
+// StubExecutor is a fail-closed implementation used until issue #9 wires real
+// RPCs. It never reports a write as successful.
 type StubExecutor struct{}
 
-// CurrentFeePolicy returns a stable stub value until issue #9 wires real RPCs.
+// CurrentFeePolicy fails until issue #9 wires real RPCs.
 func (s *StubExecutor) CurrentFeePolicy(_ context.Context, _ uint64) (FeePolicy, error) {
-	return FeePolicy{}, nil
+	return FeePolicy{}, ErrNotImplemented
 }
 
-// ExecuteFeeSet is a stub that always succeeds without contacting LND.
+// ExecuteFeeSet fails until issue #9 wires real RPCs.
 func (s *StubExecutor) ExecuteFeeSet(_ context.Context, _ FeeSetRequest) error {
-	return nil
+	return ErrNotImplemented
 }

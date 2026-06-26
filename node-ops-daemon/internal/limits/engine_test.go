@@ -108,3 +108,10 @@ func TestNewEngine_BadCooldown(t *testing.T) {
 		t.Error("expected error for invalid duration")
 	}
 }
+
+func TestNewEngine_NegativeCooldown(t *testing.T) {
+	_, err := limits.New(config.Limits{PerChannelCooldown: "-1h"})
+	if err == nil {
+		t.Error("expected error for negative duration")
+	}
+}
