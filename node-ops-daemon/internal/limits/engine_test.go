@@ -78,6 +78,22 @@ func TestCheckRebalance_DailyBudget(t *testing.T) {
 	}
 }
 
+func TestCheckRebalance_RejectsNegativeValues(t *testing.T) {
+	eng := newEngine(t, config.Limits{
+		DailyRebalanceBudgetSat: 1000,
+		MaxFeePpmDelta:          1000,
+		PerChannelCooldown:      "0s",
+		RebalanceMaxFeePpm:      1000,
+	})
+
+	if err := eng.CheckRebalance(1, -1, 100); err == nil {
+		t.Error("expected error for negative amount")
+	}
+	if err := eng.CheckRebalance(1, 100, -1); err == nil {
+		t.Error("expected error for negative fee ppm")
+	}
+}
+
 func TestCheckRebalance_Cooldown(t *testing.T) {
 	eng := newEngine(t, config.Limits{
 		DailyRebalanceBudgetSat: 1_000_000,

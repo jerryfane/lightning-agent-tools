@@ -59,6 +59,12 @@ func (e *Engine) CheckRebalance(chanID uint64, amtSat, feePpm int64) error {
 
 	e.resetDailyIfNeeded()
 
+	if amtSat < 0 {
+		return fmt.Errorf("rebalance amount must be non-negative")
+	}
+	if feePpm < 0 {
+		return fmt.Errorf("fee_ppm must be non-negative")
+	}
 	if feePpm > e.cfg.RebalanceMaxFeePpm {
 		return fmt.Errorf("fee_ppm %d exceeds rebalance_max_fee_ppm %d", feePpm, e.cfg.RebalanceMaxFeePpm)
 	}
@@ -99,6 +105,9 @@ func (e *Engine) RecordChannelOperation(chanID uint64) {
 func (e *Engine) RecordRebalance(chanID uint64, amtSat int64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if amtSat < 0 {
+		return
+	}
 	e.resetDailyIfNeeded()
 	e.dailySpentSat += amtSat
 	e.channelLastOp[chanID] = time.Now()

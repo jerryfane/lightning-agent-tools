@@ -8,9 +8,9 @@ package killswitch
 import "os"
 
 // Active returns true if the kill-switch file is present, indicating that
-// execution should be halted. A missing file (or any stat error) is treated
-// as inactive.
+// execution should be halted. Only a clean missing-file result is inactive;
+// any other stat error fails closed.
 func Active(path string) bool {
 	_, err := os.Stat(path)
-	return err == nil
+	return err == nil || !os.IsNotExist(err)
 }

@@ -6,6 +6,7 @@ package killswitch_test
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/killswitch"
@@ -40,5 +41,24 @@ func TestInactiveAfterRemoval(t *testing.T) {
 	os.Remove(f.Name())
 	if killswitch.Active(f.Name()) {
 		t.Error("expected killswitch to be inactive after file is removed")
+	}
+}
+
+func TestActiveWhenStatErrors(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod permission behavior differs on Windows")
+	}
+
+	dir := filepath.Join(t.TempDir(), "blocked")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	if err := os.Chmod(dir, 0000); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0700) })
+
+	if !killswitch.Active(filepath.Join(dir, "STOP")) {
+		t.Error("expected stat errors to fail closed as active")
 	}
 }
