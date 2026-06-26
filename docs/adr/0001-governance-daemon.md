@@ -98,8 +98,10 @@ graph TD
 
 7. **Approval — a pending queue, not a blocking prompt.** A money-affecting request
    above the auto-execute threshold is persisted as `pending` and surfaced
-   conversationally; a human approves out-of-band (`node-ops approve <request_id>` or
-   an MCP `approve` tool). **All** money-affecting actions pass the gate — closing the
+   conversationally; a human approves out-of-band through an operator-only surface
+   such as `node-ops approve <request_id>`. Approval is never exposed through the
+   same model-callable MCP session as write execution, so the agent cannot approve
+   its own request. **All** money-affecting actions pass the gate — closing the
    ungated-fee-set hole in abacus/LNDg.
 
 8. **Kill-switch — independent of any LLM turn.** Presence of the `killswitch` file
