@@ -35,6 +35,7 @@ type Manager struct {
 	onchainService    *tools.OnChainService
 	peerService       *tools.PeerService
 	nodeService       *tools.NodeService
+	rebalanceService  *tools.RebalanceService
 	feeService        *tools.FeeService
 }
 
@@ -61,6 +62,7 @@ func (m *Manager) InitializeServices() {
 	m.onchainService = tools.NewOnChainService(nil)
 	m.peerService = tools.NewPeerService(nil)
 	m.nodeService = tools.NewNodeService(nil)
+	m.rebalanceService = tools.NewRebalanceService(nil)
 	m.feeService = tools.NewFeeService(nil)
 
 	m.logger.Info("Read-only services initialized successfully")
@@ -130,6 +132,10 @@ func (m *Manager) RegisterTools(mcpServer interfaces.MCPServer) error {
 	register(m.nodeService.GetInfoTool(),
 		m.nodeService.HandleGetInfo)
 
+	// Rebalance tools - read-only proposal only, no funds movement.
+	register(m.rebalanceService.ProposeRebalanceTool(),
+		m.rebalanceService.HandleProposeRebalance)
+
 	// Fee proposal tool - read-only operations.
 	register(m.feeService.ProposeFeesTool(),
 		m.feeService.HandleProposeFees)
@@ -155,6 +161,7 @@ func (m *Manager) onLNCConnectionEstablished(conn *grpc.ClientConn) {
 	m.onchainService.LightningClient = m.lightningClient
 	m.peerService.LightningClient = m.lightningClient
 	m.nodeService.LightningClient = m.lightningClient
+	m.rebalanceService.LightningClient = m.lightningClient
 	m.feeService.LightningClient = m.lightningClient
 
 	logger.Info("All read-only services updated with new connection")

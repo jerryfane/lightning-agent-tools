@@ -31,15 +31,15 @@ func (s *FeeService) ProposeFeesTool() *mcp.Tool {
 		Name: "lnc_propose_fees",
 		Description: "Analyse routing history and channel balances to propose " +
 			"fee-rate adjustments per channel. Read-only: uses " +
-			"ForwardingHistory and ListChannels only.",
+			"ForwardingHistory, FeeReport, and ListChannels only.",
 		InputSchema: ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
 				"days": map[string]any{
-					"type":        "number",
-					"description": "Lookback window in days for forwarding history (default 7, max 90)",
-					"minimum":     1,
-					"maximum":     90,
+					"type":             "number",
+					"description":      "Lookback window in days for forwarding history (default 7, max 90)",
+					"exclusiveMinimum": 0,
+					"maximum":          90,
 				},
 				"min_fee_ppm": map[string]any{
 					"type":        "number",
@@ -147,6 +147,19 @@ func (s *FeeService) HandleProposeFees(ctx context.Context,
 			"Failed to list channels: " + err.Error()), nil
 	}
 
+	feeReport, err := s.LightningClient.FeeReport(
+		ctx, &lnrpc.FeeReportRequest{},
+	)
+	if err != nil {
+		return newToolResultError(
+			"Failed to fetch fee report: " + err.Error()), nil
+	}
+	currentFees := make(map[uint64]*lnrpc.ChannelFeeReport,
+		len(feeReport.ChannelFees))
+	for _, fee := range feeReport.ChannelFees {
+		currentFees[fee.ChanId] = fee
+	}
+
 	proposals := make([]map[string]any, 0, len(channels.Channels))
 	for _, ch := range channels.Channels {
 		localRatio := float64(0)
@@ -171,8 +184,15 @@ func (s *FeeService) HandleProposeFees(ctx context.Context,
 			"remote_balance":   ch.RemoteBalance,
 			"local_ratio":      round2(localRatio),
 			"forwards_out":     forwards,
+			"current_fee_ppm":  nil,
 			"proposed_fee_ppm": proposedPPM,
+			"fee_delta_ppm":    nil,
 			"reason":           feeReason(localRatio, forwards),
+		}
+		if fee := currentFees[ch.ChanId]; fee != nil {
+			entry["current_fee_ppm"] = fee.FeePerMil
+			entry["current_base_fee_msat"] = fee.BaseFeeMsat
+			entry["fee_delta_ppm"] = proposedPPM - fee.FeePerMil
 		}
 		if st != nil {
 			entry["amt_routed_msat"] = st.amtOutMsat

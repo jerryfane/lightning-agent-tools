@@ -22,6 +22,7 @@ type mockFeeClient struct {
 	lnrpc.LightningClient
 	forwardingHistory func(context.Context, *lnrpc.ForwardingHistoryRequest, ...grpc.CallOption) (*lnrpc.ForwardingHistoryResponse, error)
 	listChannels      func(context.Context, *lnrpc.ListChannelsRequest, ...grpc.CallOption) (*lnrpc.ListChannelsResponse, error)
+	feeReport         func(context.Context, *lnrpc.FeeReportRequest, ...grpc.CallOption) (*lnrpc.FeeReportResponse, error)
 }
 
 func (m *mockFeeClient) ForwardingHistory(ctx context.Context, in *lnrpc.ForwardingHistoryRequest, opts ...grpc.CallOption) (*lnrpc.ForwardingHistoryResponse, error) {
@@ -30,6 +31,13 @@ func (m *mockFeeClient) ForwardingHistory(ctx context.Context, in *lnrpc.Forward
 
 func (m *mockFeeClient) ListChannels(ctx context.Context, in *lnrpc.ListChannelsRequest, opts ...grpc.CallOption) (*lnrpc.ListChannelsResponse, error) {
 	return m.listChannels(ctx, in, opts...)
+}
+
+func (m *mockFeeClient) FeeReport(ctx context.Context, in *lnrpc.FeeReportRequest, opts ...grpc.CallOption) (*lnrpc.FeeReportResponse, error) {
+	if m.feeReport == nil {
+		return &lnrpc.FeeReportResponse{}, nil
+	}
+	return m.feeReport(ctx, in, opts...)
 }
 
 // makeFeeRequest builds a CallToolRequest with the given JSON arguments.
@@ -143,6 +151,11 @@ func TestFeeService_ProposeFeesTool(t *testing.T) {
 	assert.Contains(t, schema.Properties, "days")
 	assert.Contains(t, schema.Properties, "min_fee_ppm")
 	assert.Contains(t, schema.Properties, "max_fee_ppm")
+
+	days, ok := schema.Properties["days"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, 0, days["exclusiveMinimum"])
+	assert.NotContains(t, days, "minimum")
 }
 
 // --- HandleProposeFees handler tests ---
@@ -210,6 +223,51 @@ func TestHandleProposeFees_FractionalDays(t *testing.T) {
 	var resp map[string]any
 	require.NoError(t, json.Unmarshal([]byte(text), &resp))
 	assert.Equal(t, 0.5, resp["lookback_days"])
+}
+
+func TestHandleProposeFees_IncludesCurrentFees(t *testing.T) {
+	mock := &mockFeeClient{
+		forwardingHistory: func(_ context.Context, _ *lnrpc.ForwardingHistoryRequest, _ ...grpc.CallOption) (*lnrpc.ForwardingHistoryResponse, error) {
+			return &lnrpc.ForwardingHistoryResponse{}, nil
+		},
+		listChannels: func(_ context.Context, _ *lnrpc.ListChannelsRequest, _ ...grpc.CallOption) (*lnrpc.ListChannelsResponse, error) {
+			return &lnrpc.ListChannelsResponse{
+				Channels: []*lnrpc.Channel{{
+					ChanId: 1, Capacity: 1_000_000,
+					LocalBalance: 500_000, RemoteBalance: 500_000,
+				}},
+			}, nil
+		},
+		feeReport: func(_ context.Context, _ *lnrpc.FeeReportRequest, _ ...grpc.CallOption) (*lnrpc.FeeReportResponse, error) {
+			return &lnrpc.FeeReportResponse{
+				ChannelFees: []*lnrpc.ChannelFeeReport{{
+					ChanId:       1,
+					BaseFeeMsat:  1_000,
+					FeePerMil:    250,
+					ChannelPoint: "tx:0",
+				}},
+			}, nil
+		},
+	}
+
+	svc := NewFeeService(mock)
+	result, err := svc.HandleProposeFees(context.Background(), makeFeeRequest(nil))
+	require.NoError(t, err)
+	require.False(t, result.IsError)
+
+	text := result.Content[0].(*mcp.TextContent).Text
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal([]byte(text), &resp))
+	proposals := resp["proposals"].([]any)
+	require.Len(t, proposals, 1)
+	proposal := proposals[0].(map[string]any)
+
+	assert.Equal(t, float64(250), proposal["current_fee_ppm"])
+	assert.Equal(t, float64(1_000), proposal["current_base_fee_msat"])
+	assert.Equal(t,
+		proposal["proposed_fee_ppm"].(float64)-proposal["current_fee_ppm"].(float64),
+		proposal["fee_delta_ppm"],
+	)
 }
 
 // TestHandleProposeFees_Pagination covers bug-3: history spanning more than
