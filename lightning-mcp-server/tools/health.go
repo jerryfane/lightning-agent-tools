@@ -6,6 +6,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -126,6 +127,11 @@ func (s *HealthService) HandleNodeHealth(ctx context.Context,
 		}
 	}
 
+	sort.SliceStable(alerts, func(i, j int) bool {
+		return healthSeverityRank(alerts[i]["severity"]) <
+			healthSeverityRank(alerts[j]["severity"])
+	})
+
 	// Summarize counts per severity.
 	critical, warning := 0, 0
 	for _, a := range alerts {
@@ -145,15 +151,26 @@ func (s *HealthService) HandleNodeHealth(ctx context.Context,
 	}
 
 	return newToolResultJSON(map[string]any{
-		"overall_status":   overall,
-		"alert_count":      len(alerts),
-		"critical_count":   critical,
-		"warning_count":    warning,
-		"alerts":           alerts,
-		"node_id":          info.IdentityPubkey,
-		"alias":            info.Alias,
-		"synced_to_chain":  info.SyncedToChain,
-		"synced_to_graph":  info.SyncedToGraph,
-		"block_height":     info.BlockHeight,
+		"overall_status":  overall,
+		"alert_count":     len(alerts),
+		"critical_count":  critical,
+		"warning_count":   warning,
+		"alerts":          alerts,
+		"node_id":         info.IdentityPubkey,
+		"alias":           info.Alias,
+		"synced_to_chain": info.SyncedToChain,
+		"synced_to_graph": info.SyncedToGraph,
+		"block_height":    info.BlockHeight,
 	}), nil
+}
+
+func healthSeverityRank(severity any) int {
+	switch severity {
+	case "critical":
+		return 0
+	case "warning":
+		return 1
+	default:
+		return 2
+	}
 }
