@@ -18,7 +18,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -320,19 +319,6 @@ func prepareSocketDir(dir string) error {
 	}
 	if info.Mode().Perm()&0077 != 0 {
 		return fmt.Errorf("socket dir %s has unsafe permissions %03o", dir, info.Mode().Perm())
-	}
-	return nil
-}
-
-func checkSocketDirOwner(dir string, info os.FileInfo) error {
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return fmt.Errorf("inspect socket dir owner %s: unsupported stat type", dir)
-	}
-	uid := uint32(os.Geteuid())
-	if stat.Uid != uid {
-		return fmt.Errorf("socket dir %s owner uid %d does not match process uid %d",
-			dir, stat.Uid, uid)
 	}
 	return nil
 }
