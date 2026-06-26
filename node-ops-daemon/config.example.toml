@@ -19,7 +19,7 @@ rebalance_max_fee_ppm = 500
 auto_execute_below_ppm_delta = 20
 
 # When true, every action is queued for human review regardless of size.
-require_approval = false
+require_approval = true
 
 [storage]
 # Path to the append-only SQLite audit ledger.

@@ -21,7 +21,7 @@ type Entry struct {
 	RequestID string
 	Action    string
 	Params    string // JSON-encoded params
-	Status    string // "pending" | "executed" | "rejected" | "failed" | "approved" | "ok"
+	Status    string // "accepted" | "pending" | "executed" | "rejected" | "failed" | "ok"
 	Reason    string // human-readable explanation (empty for success)
 	CreatedAt time.Time
 }

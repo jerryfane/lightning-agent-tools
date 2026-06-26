@@ -143,14 +143,11 @@ func (d *Daemon) dispatch(req Request) Response {
 	reqID := uuid.New().String()
 
 	if killswitch.Active(d.cfg.Storage.KillswitchFile) {
-		_ = d.ledger.Record(ledger.Entry{
-			RequestID: reqID,
-			Action:    req.Action,
-			Params:    string(req.Params),
-			Status:    "rejected",
-			Reason:    "killswitch active",
-			CreatedAt: time.Now(),
-		})
+		if err := d.record(reqID, req.Action, req.Params, "rejected",
+			"killswitch active"); err != nil {
+
+			return ledgerFailure(reqID, err)
+		}
 		return Response{
 			Status:    "error",
 			RequestID: reqID,
@@ -164,7 +161,9 @@ func (d *Daemon) dispatch(req Request) Response {
 	case "list_pending":
 		return d.handleListPending(reqID)
 	case "status":
-		d.record(reqID, req.Action, req.Params, "ok", "")
+		if err := d.record(reqID, req.Action, req.Params, "ok", ""); err != nil {
+			return ledgerFailure(reqID, err)
+		}
 		return Response{
 			Status:    "ok",
 			RequestID: reqID,
@@ -172,7 +171,9 @@ func (d *Daemon) dispatch(req Request) Response {
 		}
 	default:
 		reason := fmt.Sprintf("unknown action: %q", req.Action)
-		d.record(reqID, req.Action, req.Params, "rejected", reason)
+		if err := d.record(reqID, req.Action, req.Params, "rejected", reason); err != nil {
+			return ledgerFailure(reqID, err)
+		}
 		return Response{
 			Status:    "error",
 			RequestID: reqID,
@@ -182,9 +183,9 @@ func (d *Daemon) dispatch(req Request) Response {
 }
 
 func (d *Daemon) record(reqID, action string, params json.RawMessage,
-	status, reason string) {
+	status, reason string) error {
 
-	_ = d.ledger.Record(ledger.Entry{
+	return d.ledger.Record(ledger.Entry{
 		RequestID: reqID,
 		Action:    action,
 		Params:    string(params),
@@ -192,6 +193,14 @@ func (d *Daemon) record(reqID, action string, params json.RawMessage,
 		Reason:    reason,
 		CreatedAt: time.Now(),
 	})
+}
+
+func ledgerFailure(reqID string, err error) Response {
+	return Response{
+		Status:    "error",
+		RequestID: reqID,
+		Reason:    "audit ledger unavailable: " + err.Error(),
+	}
 }
 
 // feeSetParams are the parameters for the execute_fee_set action.
@@ -205,17 +214,21 @@ type feeSetParams struct {
 func (d *Daemon) handleFeeSet(reqID string, raw json.RawMessage) Response {
 	var p feeSetParams
 	if err := json.Unmarshal(raw, &p); err != nil {
-		d.record(reqID, "execute_fee_set", raw, "rejected",
-			"invalid params: "+err.Error())
+		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
+			"invalid params: "+err.Error()); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
 		return Response{Status: "error", RequestID: reqID, Reason: "invalid params: " + err.Error()}
 	}
 
 	delta := p.FeePpm - p.OldPpm
 	if err := d.limits.CheckFeeDelta(delta); err != nil {
-		_ = d.ledger.Record(ledger.Entry{
-			RequestID: reqID, Action: "execute_fee_set",
-			Params: string(raw), Status: "rejected", Reason: err.Error(), CreatedAt: time.Now(),
-		})
+		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
+			err.Error()); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
 		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
 	}
 
@@ -227,30 +240,32 @@ func (d *Daemon) handleFeeSet(reqID string, raw json.RawMessage) Response {
 		absDelta > d.cfg.Approval.AutoExecuteBelowPpmDelta
 
 	if !needsApproval {
+		if err := d.record(reqID, "execute_fee_set", raw, "accepted", ""); err != nil {
+			return ledgerFailure(reqID, err)
+		}
 		if err := d.executor.ExecuteFeeSet(context.Background(), executor.FeeSetRequest{
 			ChanID: p.ChanID, BaseMsat: p.BaseMsat, FeePpm: p.FeePpm,
 		}); err != nil {
-			_ = d.ledger.Record(ledger.Entry{
-				RequestID: reqID, Action: "execute_fee_set",
-				Params: string(raw), Status: "failed", Reason: err.Error(), CreatedAt: time.Now(),
-			})
+			if recErr := d.record(reqID, "execute_fee_set", raw, "failed",
+				err.Error()); recErr != nil {
+
+				return ledgerFailure(reqID, recErr)
+			}
 			return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
 		}
-		_ = d.ledger.Record(ledger.Entry{
-			RequestID: reqID, Action: "execute_fee_set",
-			Params: string(raw), Status: "executed", CreatedAt: time.Now(),
-		})
+		if err := d.record(reqID, "execute_fee_set", raw, "executed", ""); err != nil {
+			return ledgerFailure(reqID, err)
+		}
 		return Response{Status: "ok", RequestID: reqID,
 			Result: map[string]interface{}{"executed": true, "chan_id": p.ChanID}}
 	}
 
+	if err := d.record(reqID, "execute_fee_set", raw, "pending", ""); err != nil {
+		return ledgerFailure(reqID, err)
+	}
 	d.queue.Enqueue(queue.Item{
 		RequestID: reqID, Action: "execute_fee_set",
 		Params: string(raw), CreatedAt: time.Now(),
-	})
-	_ = d.ledger.Record(ledger.Entry{
-		RequestID: reqID, Action: "execute_fee_set",
-		Params: string(raw), Status: "pending", CreatedAt: time.Now(),
 	})
 	return Response{
 		Status: "pending", RequestID: reqID,
@@ -263,7 +278,9 @@ func (d *Daemon) handleListPending(reqID string) Response {
 	if items == nil {
 		items = []queue.Item{}
 	}
-	d.record(reqID, "list_pending", nil, "ok", "")
+	if err := d.record(reqID, "list_pending", nil, "ok", ""); err != nil {
+		return ledgerFailure(reqID, err)
+	}
 	return Response{Status: "ok", RequestID: reqID, Result: items}
 }
 
