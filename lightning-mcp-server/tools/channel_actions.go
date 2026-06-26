@@ -14,9 +14,14 @@ import (
 )
 
 const (
-	defaultLookbackDays    = 30
-	maxForwardingEvents    = 50000
-	minChannelCountForOpen = 5
+	defaultLookbackDays           = 30
+	maxLookbackDays               = 365
+	channelActionsHistoryPageSize = uint32(50000)
+	minChannelCountForOpen        = 5
+	defaultCloseCandidates        = 10
+	maxCloseCandidates            = 50
+	defaultOpenCandidates         = 5
+	maxOpenCandidates             = 20
 )
 
 // ChannelActionsService proposes read-only channel open/close candidates.
@@ -82,18 +87,18 @@ func (s *ChannelActionsService) HandleProposeChannelActions(
 				"Use lnc_connect first."), nil
 	}
 
-	lookbackDays := defaultLookbackDays
-	if v, ok := args["lookback_days"].(float64); ok && v >= 1 {
-		lookbackDays = int(v)
-	}
-	maxClose := 10
-	if v, ok := args["max_close_candidates"].(float64); ok && v >= 1 {
-		maxClose = int(v)
-	}
-	maxOpen := 5
-	if v, ok := args["max_open_candidates"].(float64); ok && v >= 1 {
-		maxOpen = int(v)
-	}
+	lookbackDays := boundedIntArg(
+		args, "lookback_days", defaultLookbackDays, 1,
+		maxLookbackDays,
+	)
+	maxClose := boundedIntArg(
+		args, "max_close_candidates", defaultCloseCandidates, 1,
+		maxCloseCandidates,
+	)
+	maxOpen := boundedIntArg(
+		args, "max_open_candidates", defaultOpenCandidates, 1,
+		maxOpenCandidates,
+	)
 
 	// Fetch all open channels.
 	chanResp, err := s.LightningClient.ListChannels(
@@ -104,25 +109,42 @@ func (s *ChannelActionsService) HandleProposeChannelActions(
 			"Failed to list channels: " + err.Error()), nil
 	}
 
-	// Fetch forwarding history for the lookback window.
 	now := uint64(time.Now().Unix())
-	fwdResp, err := s.LightningClient.ForwardingHistory(
-		ctx, &lnrpc.ForwardingHistoryRequest{
-			StartTime:    now - uint64(lookbackDays*86400),
-			EndTime:      now,
-			NumMaxEvents: maxForwardingEvents,
-		},
-	)
-	if err != nil {
-		return newToolResultError(
-			"Failed to get forwarding history: " + err.Error()), nil
-	}
+	startTime := now - uint64(lookbackDays)*86400
 
-	// Build set of channel IDs seen in forwarding events.
 	activeFwdChans := make(map[uint64]bool)
-	for _, evt := range fwdResp.ForwardingEvents {
-		activeFwdChans[evt.ChanIdIn] = true
-		activeFwdChans[evt.ChanIdOut] = true
+	forwardingEvents := 0
+	var offset uint32
+	for {
+		fwdResp, err := s.LightningClient.ForwardingHistory(
+			ctx, &lnrpc.ForwardingHistoryRequest{
+				StartTime:    startTime,
+				EndTime:      now,
+				NumMaxEvents: channelActionsHistoryPageSize,
+				IndexOffset:  offset,
+			},
+		)
+		if err != nil {
+			return newToolResultError(
+				"Failed to get forwarding history: " +
+					err.Error()), nil
+		}
+
+		forwardingEvents += len(fwdResp.ForwardingEvents)
+		for _, evt := range fwdResp.ForwardingEvents {
+			activeFwdChans[evt.ChanIdIn] = true
+			activeFwdChans[evt.ChanIdOut] = true
+		}
+		if uint32(len(fwdResp.ForwardingEvents)) <
+			channelActionsHistoryPageSize {
+			break
+		}
+		if fwdResp.LastOffsetIndex <= offset {
+			return newToolResultError(
+				"Failed to paginate forwarding history: " +
+					"non-advancing offset"), nil
+		}
+		offset = fwdResp.LastOffsetIndex
 	}
 
 	noFwdReason := "no_forwards_in_" + strconv.Itoa(lookbackDays) + "d"
@@ -167,6 +189,9 @@ func (s *ChannelActionsService) HandleProposeChannelActions(
 	}
 
 	sort.Slice(closeEntries, func(i, j int) bool {
+		if closeEntries[i].score == closeEntries[j].score {
+			return closeEntries[i].ch.ChanId < closeEntries[j].ch.ChanId
+		}
 		return closeEntries[i].score > closeEntries[j].score
 	})
 	if len(closeEntries) > maxClose {
@@ -191,17 +216,22 @@ func (s *ChannelActionsService) HandleProposeChannelActions(
 	}
 
 	// Open candidates: well-connected nodes not already peered with.
-	openResult := buildOpenCandidates(
+	openResult, openErr := buildOpenCandidates(
 		ctx, s.LightningClient, existingPeers, maxOpen,
 	)
 
-	return newToolResultJSON(map[string]any{
+	response := map[string]any{
 		"close_candidates":     closeResult,
 		"open_candidates":      openResult,
 		"analysis_window_days": lookbackDays,
 		"total_channels":       len(chanResp.Channels),
-		"forwarding_events":    len(fwdResp.ForwardingEvents),
-	}), nil
+		"forwarding_events":    forwardingEvents,
+	}
+	if openErr != nil {
+		response["open_candidates_error"] = openErr.Error()
+	}
+
+	return newToolResultJSON(response), nil
 }
 
 // buildOpenCandidates returns well-connected nodes from the network graph
@@ -211,13 +241,18 @@ func buildOpenCandidates(
 	client lnrpc.LightningClient,
 	existingPeers map[string]bool,
 	maxCandidates int,
-) []map[string]any {
+) ([]map[string]any, error) {
+
+	info, err := client.GetInfo(ctx, &lnrpc.GetInfoRequest{})
+	if err != nil {
+		return []map[string]any{}, err
+	}
 
 	graph, err := client.DescribeGraph(
 		ctx, &lnrpc.ChannelGraphRequest{IncludeUnannounced: false},
 	)
 	if err != nil {
-		return nil
+		return []map[string]any{}, err
 	}
 
 	nodeChanCount := make(map[string]int)
@@ -234,6 +269,12 @@ func buildOpenCandidates(
 		aliasMap[node.PubKey] = node.Alias
 	}
 
+	excludedPeers := make(map[string]bool, len(existingPeers)+1)
+	for peer := range existingPeers {
+		excludedPeers[peer] = true
+	}
+	excludedPeers[info.IdentityPubkey] = true
+
 	type candidate struct {
 		pubKey   string
 		alias    string
@@ -243,7 +284,7 @@ func buildOpenCandidates(
 
 	var candidates []candidate
 	for pubKey, numChans := range nodeChanCount {
-		if existingPeers[pubKey] || numChans < minChannelCountForOpen {
+		if excludedPeers[pubKey] || numChans < minChannelCountForOpen {
 			continue
 		}
 		candidates = append(candidates, candidate{
@@ -255,7 +296,13 @@ func buildOpenCandidates(
 	}
 
 	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].numChans > candidates[j].numChans
+		if candidates[i].numChans != candidates[j].numChans {
+			return candidates[i].numChans > candidates[j].numChans
+		}
+		if candidates[i].capacity != candidates[j].capacity {
+			return candidates[i].capacity > candidates[j].capacity
+		}
+		return candidates[i].pubKey < candidates[j].pubKey
 	})
 	if len(candidates) > maxCandidates {
 		candidates = candidates[:maxCandidates]
@@ -271,5 +318,21 @@ func buildOpenCandidates(
 			"reasons":        []string{"well_connected_node"},
 		}
 	}
-	return result
+	return result, nil
+}
+
+func boundedIntArg(args map[string]any, key string, defaultValue, minValue,
+	maxValue int) int {
+
+	value := defaultValue
+	if raw, ok := args[key].(float64); ok {
+		value = int(raw)
+	}
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
 }
