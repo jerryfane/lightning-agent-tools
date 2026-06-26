@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -85,8 +86,8 @@ func (d *Daemon) Close() error {
 // Run listens on sockPath (Unix domain socket, mode 0600) and handles clients
 // until ctx is cancelled.
 func (d *Daemon) Run(ctx context.Context, sockPath string) error {
-	if err := os.MkdirAll(filepath.Dir(sockPath), 0700); err != nil {
-		return fmt.Errorf("create socket dir: %w", err)
+	if err := prepareSocketDir(filepath.Dir(sockPath)); err != nil {
+		return err
 	}
 	if err := removeStaleSocket(sockPath); err != nil {
 		return err
@@ -290,12 +291,63 @@ func parseFeeSetParams(raw json.RawMessage) (feeSetParams, error) {
 	}, nil
 }
 
+func prepareSocketDir(dir string) error {
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("create socket dir: %w", err)
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("stat socket dir %s: %w", dir, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("socket dir %s must not be a symlink", dir)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("socket dir %s is not a directory", dir)
+	}
+	if err := checkSocketDirOwner(dir, info); err != nil {
+		return err
+	}
+	if info.Mode().Perm()&0077 == 0 {
+		return nil
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return fmt.Errorf("secure socket dir %s: %w", dir, err)
+	}
+	info, err = os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("stat socket dir %s: %w", dir, err)
+	}
+	if info.Mode().Perm()&0077 != 0 {
+		return fmt.Errorf("socket dir %s has unsafe permissions %03o", dir, info.Mode().Perm())
+	}
+	return nil
+}
+
+func checkSocketDirOwner(dir string, info os.FileInfo) error {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("inspect socket dir owner %s: unsupported stat type", dir)
+	}
+	uid := uint32(os.Geteuid())
+	if stat.Uid != uid {
+		return fmt.Errorf("socket dir %s owner uid %d does not match process uid %d",
+			dir, stat.Uid, uid)
+	}
+	return nil
+}
+
 func removeStaleSocket(sockPath string) error {
-	if _, err := os.Lstat(sockPath); err != nil {
+	info, err := os.Lstat(sockPath)
+	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return fmt.Errorf("stat socket %s: %w", sockPath, err)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("refusing to remove non-socket path %s (mode %s)",
+			sockPath, info.Mode())
 	}
 	conn, err := net.DialTimeout("unix", sockPath, time.Second)
 	if err == nil {

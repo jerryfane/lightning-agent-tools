@@ -243,6 +243,85 @@ func TestRunRefusesActiveSocket(t *testing.T) {
 	}
 }
 
+func TestPrepareSocketDirSecuresExistingDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "node-ops")
+	if err := os.Mkdir(dir, 0777); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+
+	if err := prepareSocketDir(dir); err != nil {
+		t.Fatalf("prepareSocketDir: %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if info.Mode().Perm()&0077 != 0 {
+		t.Fatalf("socket dir still allows group/other access: %03o",
+			info.Mode().Perm())
+	}
+}
+
+func TestRemoveStaleSocketRejectsNonSocketPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, path string)
+	}{
+		{
+			name: "regular file",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte("data"), 0600); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+			},
+		},
+		{
+			name: "directory",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Mkdir(path, 0700); err != nil {
+					t.Fatalf("Mkdir: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "daemon.sock")
+			tc.setup(t, path)
+
+			err := removeStaleSocket(path)
+			if err == nil || !strings.Contains(err.Error(), "non-socket") {
+				t.Fatalf("expected non-socket rejection, got %v", err)
+			}
+			if _, statErr := os.Lstat(path); statErr != nil {
+				t.Fatalf("path was removed despite rejection: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestRemoveStaleSocketRemovesInactiveSocket(t *testing.T) {
+	sockPath := filepath.Join(t.TempDir(), "daemon.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	if err := ln.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if err := removeStaleSocket(sockPath); err != nil {
+		t.Fatalf("removeStaleSocket: %v", err)
+	}
+	if _, err := os.Lstat(sockPath); !os.IsNotExist(err) {
+		t.Fatalf("expected stale socket removal, stat err=%v", err)
+	}
+}
+
 func TestDispatchKillSwitchHaltsAndLogs(t *testing.T) {
 	d := newTestDaemon(t, nil)
 	if err := os.WriteFile(d.cfg.Storage.KillswitchFile, []byte("stop"), 0600); err != nil {
