@@ -23,7 +23,7 @@ and run the read tools against it.**
 skills/lightning-mcp-server/scripts/install.sh
 
 # …or directly from the module
-cd lightning-mcp-server && go build ./...
+cd lightning-mcp-server && go build -o ./lightning-mcp-server .
 ```
 
 ## 2. Bring up a regtest stack (litd + bitcoind)
@@ -60,7 +60,7 @@ dev tunnel carries least privilege:
 
 ```bash
 docker exec litd litcli --network=regtest sessions add \
-  --label dev-mcp --type read-only
+  --label dev-mcp --type readonly
 # copy the 10-word `pairing_secret_mnemonic` from the output
 ```
 
