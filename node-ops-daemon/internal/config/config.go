@@ -85,14 +85,14 @@ func Defaults() *Config {
 
 // Load parses a TOML config file and returns a Config.
 func Load(path string) (*Config, error) {
-	var c Config
-	if _, err := toml.DecodeFile(path, &c); err != nil {
+	c := Defaults()
+	if _, err := toml.DecodeFile(path, c); err != nil {
 		return nil, fmt.Errorf("load config %s: %w", path, err)
 	}
 	if err := c.expand(); err != nil {
 		return nil, err
 	}
-	return &c, nil
+	return c, nil
 }
 
 // expand resolves ~ in storage paths.

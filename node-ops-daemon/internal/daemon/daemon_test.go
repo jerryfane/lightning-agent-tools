@@ -6,6 +6,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,9 +18,9 @@ import (
 )
 
 func newTestDaemon(t *testing.T, mutate func(*config.Config)) *Daemon {
-	return newTestDaemonWithExecutor(t, mutate, newFakeExecutor(map[uint64]int64{
-		1:  100,
-		42: 100,
+	return newTestDaemonWithExecutor(t, mutate, newFakeExecutor(map[uint64]executor.FeePolicy{
+		1:  {BaseMsat: 1_000, FeePpm: 100},
+		42: {BaseMsat: 1_000, FeePpm: 100},
 	}))
 }
 
@@ -58,19 +59,28 @@ func newTestDaemonWithExecutor(t *testing.T, mutate func(*config.Config),
 }
 
 type fakeExecutor struct {
-	mu       sync.Mutex
-	current  map[uint64]int64
-	executed []executor.FeeSetRequest
+	mu        sync.Mutex
+	current   map[uint64]executor.FeePolicy
+	executed  []executor.FeeSetRequest
+	onCurrent func()
 }
 
-func newFakeExecutor(current map[uint64]int64) *fakeExecutor {
+func newFakeExecutor(current map[uint64]executor.FeePolicy) *fakeExecutor {
 	return &fakeExecutor{current: current}
 }
 
-func (f *fakeExecutor) CurrentFeePpm(_ context.Context, chanID uint64) (int64, error) {
+func (f *fakeExecutor) CurrentFeePolicy(_ context.Context,
+	chanID uint64) (executor.FeePolicy, error) {
+
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.current[chanID], nil
+	current := f.current[chanID]
+	onCurrent := f.onCurrent
+	f.mu.Unlock()
+
+	if onCurrent != nil {
+		onCurrent()
+	}
+	return current, nil
 }
 
 func (f *fakeExecutor) ExecuteFeeSet(_ context.Context,
@@ -79,7 +89,10 @@ func (f *fakeExecutor) ExecuteFeeSet(_ context.Context,
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.executed = append(f.executed, req)
-	f.current[req.ChanID] = req.FeePpm
+	f.current[req.ChanID] = executor.FeePolicy{
+		BaseMsat: req.BaseMsat,
+		FeePpm:   req.FeePpm,
+	}
 	return nil
 }
 
@@ -136,7 +149,7 @@ func TestDispatchAutoExecuteAppliesCooldown(t *testing.T) {
 
 	first := d.dispatch(Request{
 		Action: "execute_fee_set",
-		Params: mustJSON(t, `{"chan_id":1,"old_ppm":100,"fee_ppm":110}`),
+		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"old_ppm":100,"fee_ppm":110}`),
 	})
 	if first.Status != "ok" {
 		t.Fatalf("expected first request to execute, got %+v", first)
@@ -144,10 +157,75 @@ func TestDispatchAutoExecuteAppliesCooldown(t *testing.T) {
 
 	second := d.dispatch(Request{
 		Action: "execute_fee_set",
-		Params: mustJSON(t, `{"chan_id":1,"old_ppm":110,"fee_ppm":120}`),
+		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"old_ppm":110,"fee_ppm":120}`),
 	})
 	if second.Status != "error" || !strings.Contains(second.Reason, "cooldown") {
 		t.Fatalf("expected cooldown rejection, got %+v", second)
+	}
+}
+
+func TestDispatchBaseFeeChangeRequiresApproval(t *testing.T) {
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{
+		1: {BaseMsat: 1_000, FeePpm: 100},
+	})
+	d := newTestDaemonWithExecutor(t, func(cfg *config.Config) {
+		cfg.Approval.RequireApproval = false
+	}, fake)
+
+	resp := d.dispatch(Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":1,"base_msat":2000,"fee_ppm":100}`),
+	})
+	if resp.Status != "pending" {
+		t.Fatalf("expected base fee change to require approval, got %+v", resp)
+	}
+	if len(fake.executed) != 0 {
+		t.Fatalf("base fee change should not auto-execute: %+v", fake.executed)
+	}
+}
+
+func TestDispatchRechecksKillSwitchBeforeExecution(t *testing.T) {
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{
+		1: {BaseMsat: 0, FeePpm: 100},
+	})
+	d := newTestDaemonWithExecutor(t, func(cfg *config.Config) {
+		cfg.Approval.RequireApproval = false
+	}, fake)
+
+	var once sync.Once
+	fake.onCurrent = func() {
+		once.Do(func() {
+			if err := os.WriteFile(d.cfg.Storage.KillswitchFile, []byte("stop"), 0600); err != nil {
+				t.Fatalf("write killswitch: %v", err)
+			}
+		})
+	}
+
+	resp := d.dispatch(Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":1,"fee_ppm":110}`),
+	})
+	if resp.Status != "error" || !strings.Contains(resp.Reason, "killswitch") {
+		t.Fatalf("expected killswitch rejection, got %+v", resp)
+	}
+	if len(fake.executed) != 0 {
+		t.Fatalf("request executed despite kill-switch: %+v", fake.executed)
+	}
+}
+
+func TestRunRefusesActiveSocket(t *testing.T) {
+	d := newTestDaemon(t, nil)
+	sockPath := filepath.Join(t.TempDir(), "daemon.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+
+	if err := d.Run(context.Background(), sockPath); err == nil ||
+		!strings.Contains(err.Error(), "already active") {
+
+		t.Fatalf("expected active socket error, got %v", err)
 	}
 }
 

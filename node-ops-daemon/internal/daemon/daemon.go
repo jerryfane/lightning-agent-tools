@@ -88,8 +88,9 @@ func (d *Daemon) Run(ctx context.Context, sockPath string) error {
 	if err := os.MkdirAll(filepath.Dir(sockPath), 0700); err != nil {
 		return fmt.Errorf("create socket dir: %w", err)
 	}
-	// Remove a stale socket from a previous run.
-	_ = os.Remove(sockPath)
+	if err := removeStaleSocket(sockPath); err != nil {
+		return err
+	}
 
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
@@ -212,6 +213,11 @@ type feeSetParams struct {
 	FeePpm   int64  `json:"fee_ppm"`
 }
 
+type feeSetPolicyDelta struct {
+	ppmDelta    int64
+	baseChanged bool
+}
+
 func (d *Daemon) handleFeeSet(reqID string, raw json.RawMessage) Response {
 	var p feeSetParams
 	if err := json.Unmarshal(raw, &p); err != nil {
@@ -223,7 +229,7 @@ func (d *Daemon) handleFeeSet(reqID string, raw json.RawMessage) Response {
 		return Response{Status: "error", RequestID: reqID, Reason: "invalid params: " + err.Error()}
 	}
 
-	delta, err := d.feeDelta(context.Background(), p)
+	delta, err := d.feeSetPolicyDelta(context.Background(), p)
 	if err != nil {
 		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
 			err.Error()); recErr != nil {
@@ -232,7 +238,7 @@ func (d *Daemon) handleFeeSet(reqID string, raw json.RawMessage) Response {
 		}
 		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
 	}
-	if err := d.limits.CheckFeeDelta(delta); err != nil {
+	if err := d.limits.CheckFeeDelta(delta.ppmDelta); err != nil {
 		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
 			err.Error()); recErr != nil {
 
@@ -248,20 +254,44 @@ func (d *Daemon) handleFeeSet(reqID string, raw json.RawMessage) Response {
 	return d.queueFeeSet(reqID, raw)
 }
 
-func (d *Daemon) feeDelta(ctx context.Context, p feeSetParams) (int64, error) {
-	currentPpm, err := d.executor.CurrentFeePpm(ctx, p.ChanID)
-	if err != nil {
-		return 0, fmt.Errorf("current fee lookup failed: %w", err)
+func removeStaleSocket(sockPath string) error {
+	if _, err := os.Lstat(sockPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat socket %s: %w", sockPath, err)
 	}
-	return p.FeePpm - currentPpm, nil
+	conn, err := net.DialTimeout("unix", sockPath, time.Second)
+	if err == nil {
+		_ = conn.Close()
+		return fmt.Errorf("daemon socket already active at %s", sockPath)
+	}
+	if err := os.Remove(sockPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove stale socket %s: %w", sockPath, err)
+	}
+	return nil
 }
 
-func (d *Daemon) needsApproval(delta int64) bool {
-	if delta < 0 {
-		delta = -delta
+func (d *Daemon) feeSetPolicyDelta(ctx context.Context,
+	p feeSetParams) (feeSetPolicyDelta, error) {
+
+	current, err := d.executor.CurrentFeePolicy(ctx, p.ChanID)
+	if err != nil {
+		return feeSetPolicyDelta{}, fmt.Errorf("current fee lookup failed: %w", err)
 	}
-	return d.cfg.Approval.RequireApproval ||
-		delta > d.cfg.Approval.AutoExecuteBelowPpmDelta
+	return feeSetPolicyDelta{
+		ppmDelta:    p.FeePpm - current.FeePpm,
+		baseChanged: p.BaseMsat != current.BaseMsat,
+	}, nil
+}
+
+func (d *Daemon) needsApproval(delta feeSetPolicyDelta) bool {
+	ppmDelta := delta.ppmDelta
+	if ppmDelta < 0 {
+		ppmDelta = -ppmDelta
+	}
+	return d.cfg.Approval.RequireApproval || delta.baseChanged ||
+		ppmDelta > d.cfg.Approval.AutoExecuteBelowPpmDelta
 }
 
 func (d *Daemon) executeFeeSet(reqID string, raw json.RawMessage,
@@ -270,7 +300,7 @@ func (d *Daemon) executeFeeSet(reqID string, raw json.RawMessage,
 	d.execMu.Lock()
 	defer d.execMu.Unlock()
 
-	delta, err := d.feeDelta(context.Background(), p)
+	delta, err := d.feeSetPolicyDelta(context.Background(), p)
 	if err != nil {
 		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
 			err.Error()); recErr != nil {
@@ -279,7 +309,7 @@ func (d *Daemon) executeFeeSet(reqID string, raw json.RawMessage,
 		}
 		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
 	}
-	if err := d.limits.CheckFeeDelta(delta); err != nil {
+	if err := d.limits.CheckFeeDelta(delta.ppmDelta); err != nil {
 		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
 			err.Error()); recErr != nil {
 
@@ -297,6 +327,18 @@ func (d *Daemon) executeFeeSet(reqID string, raw json.RawMessage,
 			return ledgerFailure(reqID, recErr)
 		}
 		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
+	}
+	if killswitch.Active(d.cfg.Storage.KillswitchFile) {
+		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
+			"killswitch active"); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{
+			Status:    "error",
+			RequestID: reqID,
+			Reason:    "killswitch active: all execution is halted",
+		}
 	}
 	if err := d.record(reqID, "execute_fee_set", raw, "accepted", ""); err != nil {
 		return ledgerFailure(reqID, err)

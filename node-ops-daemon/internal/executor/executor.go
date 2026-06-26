@@ -18,12 +18,19 @@ type FeeSetRequest struct {
 	FeePpm   int64
 }
 
+// FeePolicy is the daemon-owned current forwarding fee policy for a channel.
+type FeePolicy struct {
+	BaseMsat int64
+	FeePpm   int64
+}
+
 // NodeExecutor is the write-side interface to an LND node.
 // Implementations must be safe for concurrent use.
 type NodeExecutor interface {
-	// CurrentFeePpm returns the daemon-owned current fee rate for a channel.
-	// Callers must not supply this value; it is part of the enforcement state.
-	CurrentFeePpm(ctx context.Context, chanID uint64) (int64, error)
+	// CurrentFeePolicy returns the daemon-owned current fee policy for a
+	// channel. Callers must not supply this value; it is part of the
+	// enforcement state.
+	CurrentFeePolicy(ctx context.Context, chanID uint64) (FeePolicy, error)
 
 	// ExecuteFeeSet applies a new fee policy to the specified channel.
 	// Returns an error if the RPC fails or the node rejects the update.
@@ -34,9 +41,9 @@ type NodeExecutor interface {
 // It succeeds silently for all requests.
 type StubExecutor struct{}
 
-// CurrentFeePpm returns a stable stub value until issue #9 wires real RPCs.
-func (s *StubExecutor) CurrentFeePpm(_ context.Context, _ uint64) (int64, error) {
-	return 0, nil
+// CurrentFeePolicy returns a stable stub value until issue #9 wires real RPCs.
+func (s *StubExecutor) CurrentFeePolicy(_ context.Context, _ uint64) (FeePolicy, error) {
+	return FeePolicy{}, nil
 }
 
 // ExecuteFeeSet is a stub that always succeeds without contacting LND.

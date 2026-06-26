@@ -33,13 +33,17 @@ import (
 
 func main() {
 	cfgPath := config.DefaultPath()
+	explicitConfig := len(os.Args) > 1
 	if len(os.Args) > 1 {
 		cfgPath = os.Args[1]
 	}
 
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		log.Printf("warn: cannot load config from %s (%v) — using built-in defaults", cfgPath, err)
+		if explicitConfig || !os.IsNotExist(err) {
+			log.Fatalf("load config: %v", err)
+		}
+		log.Printf("warn: config %s not found; using built-in defaults", cfgPath)
 		cfg = config.Defaults()
 	}
 
