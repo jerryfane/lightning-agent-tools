@@ -19,6 +19,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -40,7 +41,7 @@ func main() {
 
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		if explicitConfig || !os.IsNotExist(err) {
+		if explicitConfig || !errors.Is(err, os.ErrNotExist) {
 			log.Fatalf("load config: %v", err)
 		}
 		log.Printf("warn: config %s not found; using built-in defaults", cfgPath)
