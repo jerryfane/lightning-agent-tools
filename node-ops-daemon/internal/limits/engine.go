@@ -20,7 +20,7 @@ type Engine struct {
 	cfg           config.Limits
 	cooldown      time.Duration
 	dailySpentSat int64
-	lastResetDay  string           // "YYYY-MM-DD" in UTC
+	lastResetDay  string // "YYYY-MM-DD" in UTC
 	channelLastOp map[uint64]time.Time
 }
 
@@ -63,6 +63,18 @@ func (e *Engine) CheckRebalance(chanID uint64, amtSat, feePpm int64) error {
 		return fmt.Errorf("rebalance %d sat would exceed daily_rebalance_budget_sat %d (spent %d)",
 			amtSat, e.cfg.DailyRebalanceBudgetSat, e.dailySpentSat)
 	}
+	return e.checkChannelCooldownLocked(chanID)
+}
+
+// CheckChannelCooldown returns an error if chanID is still cooling down from a
+// previous successful operation.
+func (e *Engine) CheckChannelCooldown(chanID uint64) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.checkChannelCooldownLocked(chanID)
+}
+
+func (e *Engine) checkChannelCooldownLocked(chanID uint64) error {
 	if last, ok := e.channelLastOp[chanID]; ok && e.cooldown > 0 {
 		if elapsed := time.Since(last); elapsed < e.cooldown {
 			remaining := e.cooldown - elapsed
@@ -70,6 +82,14 @@ func (e *Engine) CheckRebalance(chanID uint64, amtSat, feePpm int64) error {
 		}
 	}
 	return nil
+}
+
+// RecordChannelOperation updates the cooldown clock after a successful
+// non-rebalance channel operation.
+func (e *Engine) RecordChannelOperation(chanID uint64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.channelLastOp[chanID] = time.Now()
 }
 
 // RecordRebalance updates internal accounting after a successful rebalance.

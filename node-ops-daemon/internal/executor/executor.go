@@ -21,6 +21,10 @@ type FeeSetRequest struct {
 // NodeExecutor is the write-side interface to an LND node.
 // Implementations must be safe for concurrent use.
 type NodeExecutor interface {
+	// CurrentFeePpm returns the daemon-owned current fee rate for a channel.
+	// Callers must not supply this value; it is part of the enforcement state.
+	CurrentFeePpm(ctx context.Context, chanID uint64) (int64, error)
+
 	// ExecuteFeeSet applies a new fee policy to the specified channel.
 	// Returns an error if the RPC fails or the node rejects the update.
 	ExecuteFeeSet(ctx context.Context, req FeeSetRequest) error
@@ -29,6 +33,11 @@ type NodeExecutor interface {
 // StubExecutor is a no-op implementation used until issue #9 wires real RPCs.
 // It succeeds silently for all requests.
 type StubExecutor struct{}
+
+// CurrentFeePpm returns a stable stub value until issue #9 wires real RPCs.
+func (s *StubExecutor) CurrentFeePpm(_ context.Context, _ uint64) (int64, error) {
+	return 0, nil
+}
 
 // ExecuteFeeSet is a stub that always succeeds without contacting LND.
 func (s *StubExecutor) ExecuteFeeSet(_ context.Context, _ FeeSetRequest) error {

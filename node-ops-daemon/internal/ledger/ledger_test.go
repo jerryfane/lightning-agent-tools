@@ -4,8 +4,10 @@
 package ledger_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -72,6 +74,48 @@ func TestRecord_AppendOnly(t *testing.T) {
 	}
 	if len(entries) != 5 {
 		t.Fatalf("expected 5 entries (append-only), got %d", len(entries))
+	}
+}
+
+func TestRecord_ConcurrentWrites(t *testing.T) {
+	l := openTemp(t)
+
+	const goroutines = 16
+	const writesPerGoroutine = 20
+
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines*writesPerGoroutine)
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for j := 0; j < writesPerGoroutine; j++ {
+				err := l.Record(ledger.Entry{
+					RequestID: fmt.Sprintf("req-%d-%d", worker, j),
+					Action:    "status",
+					Status:    "ok",
+					CreatedAt: time.Now().UTC(),
+				})
+				if err != nil {
+					errs <- err
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("Record returned error during concurrent writes: %v", err)
+	}
+
+	entries, err := l.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	expected := goroutines * writesPerGoroutine
+	if len(entries) != expected {
+		t.Fatalf("expected %d entries, got %d", expected, len(entries))
 	}
 }
 

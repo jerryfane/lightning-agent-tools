@@ -17,6 +17,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -51,6 +52,7 @@ type Daemon struct {
 	ledger   *ledger.Ledger
 	queue    *queue.Queue
 	executor executor.NodeExecutor
+	execMu   sync.Mutex
 }
 
 // New creates a Daemon, initialises the limits engine and opens the ledger.
@@ -208,7 +210,6 @@ type feeSetParams struct {
 	ChanID   uint64 `json:"chan_id"`
 	BaseMsat int64  `json:"base_msat"`
 	FeePpm   int64  `json:"fee_ppm"`
-	OldPpm   int64  `json:"old_ppm"` // current fee rate; used to compute delta
 }
 
 func (d *Daemon) handleFeeSet(reqID string, raw json.RawMessage) Response {
@@ -222,7 +223,15 @@ func (d *Daemon) handleFeeSet(reqID string, raw json.RawMessage) Response {
 		return Response{Status: "error", RequestID: reqID, Reason: "invalid params: " + err.Error()}
 	}
 
-	delta := p.FeePpm - p.OldPpm
+	delta, err := d.feeDelta(context.Background(), p)
+	if err != nil {
+		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
+			err.Error()); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
+	}
 	if err := d.limits.CheckFeeDelta(delta); err != nil {
 		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
 			err.Error()); recErr != nil {
@@ -232,34 +241,85 @@ func (d *Daemon) handleFeeSet(reqID string, raw json.RawMessage) Response {
 		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
 	}
 
-	absDelta := delta
-	if absDelta < 0 {
-		absDelta = -absDelta
-	}
-	needsApproval := d.cfg.Approval.RequireApproval ||
-		absDelta > d.cfg.Approval.AutoExecuteBelowPpmDelta
-
-	if !needsApproval {
-		if err := d.record(reqID, "execute_fee_set", raw, "accepted", ""); err != nil {
-			return ledgerFailure(reqID, err)
-		}
-		if err := d.executor.ExecuteFeeSet(context.Background(), executor.FeeSetRequest{
-			ChanID: p.ChanID, BaseMsat: p.BaseMsat, FeePpm: p.FeePpm,
-		}); err != nil {
-			if recErr := d.record(reqID, "execute_fee_set", raw, "failed",
-				err.Error()); recErr != nil {
-
-				return ledgerFailure(reqID, recErr)
-			}
-			return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
-		}
-		if err := d.record(reqID, "execute_fee_set", raw, "executed", ""); err != nil {
-			return ledgerFailure(reqID, err)
-		}
-		return Response{Status: "ok", RequestID: reqID,
-			Result: map[string]interface{}{"executed": true, "chan_id": p.ChanID}}
+	if !d.needsApproval(delta) {
+		return d.executeFeeSet(reqID, raw, p)
 	}
 
+	return d.queueFeeSet(reqID, raw)
+}
+
+func (d *Daemon) feeDelta(ctx context.Context, p feeSetParams) (int64, error) {
+	currentPpm, err := d.executor.CurrentFeePpm(ctx, p.ChanID)
+	if err != nil {
+		return 0, fmt.Errorf("current fee lookup failed: %w", err)
+	}
+	return p.FeePpm - currentPpm, nil
+}
+
+func (d *Daemon) needsApproval(delta int64) bool {
+	if delta < 0 {
+		delta = -delta
+	}
+	return d.cfg.Approval.RequireApproval ||
+		delta > d.cfg.Approval.AutoExecuteBelowPpmDelta
+}
+
+func (d *Daemon) executeFeeSet(reqID string, raw json.RawMessage,
+	p feeSetParams) Response {
+
+	d.execMu.Lock()
+	defer d.execMu.Unlock()
+
+	delta, err := d.feeDelta(context.Background(), p)
+	if err != nil {
+		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
+			err.Error()); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
+	}
+	if err := d.limits.CheckFeeDelta(delta); err != nil {
+		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
+			err.Error()); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
+	}
+	if d.needsApproval(delta) {
+		return d.queueFeeSet(reqID, raw)
+	}
+	if err := d.limits.CheckChannelCooldown(p.ChanID); err != nil {
+		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
+			err.Error()); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
+	}
+	if err := d.record(reqID, "execute_fee_set", raw, "accepted", ""); err != nil {
+		return ledgerFailure(reqID, err)
+	}
+	if err := d.executor.ExecuteFeeSet(context.Background(), executor.FeeSetRequest{
+		ChanID: p.ChanID, BaseMsat: p.BaseMsat, FeePpm: p.FeePpm,
+	}); err != nil {
+		if recErr := d.record(reqID, "execute_fee_set", raw, "failed",
+			err.Error()); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
+	}
+	d.limits.RecordChannelOperation(p.ChanID)
+	if err := d.record(reqID, "execute_fee_set", raw, "executed", ""); err != nil {
+		return ledgerFailure(reqID, err)
+	}
+	return Response{Status: "ok", RequestID: reqID,
+		Result: map[string]interface{}{"executed": true, "chan_id": p.ChanID}}
+}
+
+func (d *Daemon) queueFeeSet(reqID string, raw json.RawMessage) Response {
 	if err := d.record(reqID, "execute_fee_set", raw, "pending", ""); err != nil {
 		return ledgerFailure(reqID, err)
 	}

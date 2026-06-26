@@ -38,6 +38,8 @@ func Open(path string) (*Ledger, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open ledger %s: %w", path, err)
 	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	if err := ensureSchema(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("ledger schema: %w", err)
