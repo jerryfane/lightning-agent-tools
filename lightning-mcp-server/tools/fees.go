@@ -101,7 +101,13 @@ func (s *FeeService) HandleProposeFees(ctx context.Context,
 
 	// Bug fix: paginate ForwardingHistory so nodes with more than 50 000
 	// events in the window are not silently truncated.
-	var allEvents []*lnrpc.ForwardingEvent
+	type chanStats struct {
+		forwardsOut  int64
+		amtOutMsat   int64
+		feesEarnedMs int64
+	}
+	stats := make(map[uint64]*chanStats)
+	totalForwards := 0
 	var offset uint32
 	for {
 		batch, err := s.LightningClient.ForwardingHistory(
@@ -115,7 +121,18 @@ func (s *FeeService) HandleProposeFees(ctx context.Context,
 			return newToolResultError(
 				"Failed to fetch forwarding history: " + err.Error()), nil
 		}
-		allEvents = append(allEvents, batch.ForwardingEvents...)
+
+		totalForwards += len(batch.ForwardingEvents)
+		for _, ev := range batch.ForwardingEvents {
+			if _, ok := stats[ev.ChanIdOut]; !ok {
+				stats[ev.ChanIdOut] = &chanStats{}
+			}
+			s2 := stats[ev.ChanIdOut]
+			s2.forwardsOut++
+			s2.amtOutMsat += int64(ev.AmtOutMsat)
+			s2.feesEarnedMs += int64(ev.FeeMsat)
+		}
+
 		if uint32(len(batch.ForwardingEvents)) < feePageSize {
 			break
 		}
@@ -128,22 +145,6 @@ func (s *FeeService) HandleProposeFees(ctx context.Context,
 	if err != nil {
 		return newToolResultError(
 			"Failed to list channels: " + err.Error()), nil
-	}
-
-	type chanStats struct {
-		forwardsOut  int64
-		amtOutMsat   int64
-		feesEarnedMs int64
-	}
-	stats := make(map[uint64]*chanStats)
-	for _, ev := range allEvents {
-		if _, ok := stats[ev.ChanIdOut]; !ok {
-			stats[ev.ChanIdOut] = &chanStats{}
-		}
-		s2 := stats[ev.ChanIdOut]
-		s2.forwardsOut++
-		s2.amtOutMsat += int64(ev.AmtOutMsat)
-		s2.feesEarnedMs += int64(ev.FeeMsat)
 	}
 
 	proposals := make([]map[string]any, 0, len(channels.Channels))
@@ -162,7 +163,7 @@ func (s *FeeService) HandleProposeFees(ctx context.Context,
 		proposedPPM := proposeFee(localRatio, forwards, minFeePPM, maxFeePPM)
 
 		entry := map[string]any{
-			"chan_id":           strconv.FormatUint(ch.ChanId, 10),
+			"chan_id":          strconv.FormatUint(ch.ChanId, 10),
 			"remote_pubkey":    ch.RemotePubkey,
 			"channel_point":    ch.ChannelPoint,
 			"capacity_sat":     ch.Capacity,
@@ -181,8 +182,8 @@ func (s *FeeService) HandleProposeFees(ctx context.Context,
 	}
 
 	return newToolResultJSON(map[string]any{
-		"lookback_days":  int(days),
-		"total_forwards": len(allEvents),
+		"lookback_days":  days,
+		"total_forwards": totalForwards,
 		"proposals":      proposals,
 		"note":           "Proposals are suggestions only. Apply with UpdateChannelPolicy after review.",
 	}), nil

@@ -191,10 +191,11 @@ func TestHandleProposeFees_FractionalDays(t *testing.T) {
 
 	before := time.Now()
 	svc := NewFeeService(mock)
-	_, err := svc.HandleProposeFees(context.Background(), makeFeeRequest(map[string]any{
+	result, err := svc.HandleProposeFees(context.Background(), makeFeeRequest(map[string]any{
 		"days": 0.5,
 	}))
 	require.NoError(t, err)
+	require.False(t, result.IsError)
 
 	// 0.5 days = 12 hours ago.  Allow ±5 s for test execution.
 	expected := uint64(before.Add(-12 * time.Hour).Unix())
@@ -204,6 +205,11 @@ func TestHandleProposeFees_FractionalDays(t *testing.T) {
 	}
 	assert.LessOrEqual(t, delta, int64(5),
 		"startTime for 0.5 days must be ~12 hours ago, not zero")
+
+	text := result.Content[0].(*mcp.TextContent).Text
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal([]byte(text), &resp))
+	assert.Equal(t, 0.5, resp["lookback_days"])
 }
 
 // TestHandleProposeFees_Pagination covers bug-3: history spanning more than
