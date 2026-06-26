@@ -97,7 +97,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --inspect PATH         Inspect a macaroon file"
             echo "  --list-permissions     List all available permission URIs"
             echo ""
-            echo "Preset roles: pay-only, invoice-only, read-only, channel-admin, signer-only"
+            echo "Preset roles: pay-only, invoice-only, read-only, channel-admin, signer-only, node-ops"
             echo ""
             echo "Options:"
             echo "  --save-to PATH         Output path (default: auto-generated)"
@@ -270,9 +270,31 @@ if [ -n "$ROLE" ]; then
                 "uri:/verrpc.Versioner/GetVersion"
             )
             ;;
+        node-ops)
+            # Fee management + route-send primitives for rebalancing. Cannot
+            # open/close channels or use high-level invoice payment RPCs.
+            # ResetMissionControl is excluded because it mutates global routing
+            # history outside a bounded fee/rebalance action.
+            # lnd macaroons cannot enforce "self-pay only"; daemon logic must
+            # validate route/payment boundaries before using SendToRouteV2.
+            PERMS=(
+                "uri:/lnrpc.Lightning/GetInfo"
+                "uri:/lnrpc.Lightning/WalletBalance"
+                "uri:/lnrpc.Lightning/ChannelBalance"
+                "uri:/lnrpc.Lightning/ListChannels"
+                "uri:/lnrpc.Lightning/GetChanInfo"
+                "uri:/lnrpc.Lightning/GetNodeInfo"
+                "uri:/lnrpc.Lightning/UpdateChannelPolicy"
+                "uri:/lnrpc.Lightning/DecodePayReq"
+                "uri:/lnrpc.Lightning/QueryRoutes"
+                "uri:/routerrpc.Router/SendToRouteV2"
+                "uri:/routerrpc.Router/BuildRoute"
+                "uri:/verrpc.Versioner/GetVersion"
+            )
+            ;;
         *)
             echo "Error: Unknown role '$ROLE'." >&2
-            echo "Available roles: pay-only, invoice-only, read-only, channel-admin, signer-only" >&2
+            echo "Available roles: pay-only, invoice-only, read-only, channel-admin, signer-only, node-ops" >&2
             exit 1
             ;;
     esac
