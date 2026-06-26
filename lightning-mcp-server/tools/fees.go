@@ -119,7 +119,7 @@ func (s *FeeService) HandleProposeFees(ctx context.Context,
 		if uint32(len(batch.ForwardingEvents)) < feePageSize {
 			break
 		}
-		offset = batch.LastOffsetIndex + 1
+		offset = batch.LastOffsetIndex
 	}
 
 	channels, err := s.LightningClient.ListChannels(

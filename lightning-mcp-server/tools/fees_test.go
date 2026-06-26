@@ -215,7 +215,8 @@ func TestHandleProposeFees_Pagination(t *testing.T) {
 	mock := &mockFeeClient{
 		forwardingHistory: func(_ context.Context, in *lnrpc.ForwardingHistoryRequest, _ ...grpc.CallOption) (*lnrpc.ForwardingHistoryResponse, error) {
 			callCount++
-			if in.IndexOffset == 0 {
+			if callCount == 1 {
+				require.Equal(t, uint32(0), in.IndexOffset)
 				// First page: return a full page of events.
 				events := make([]*lnrpc.ForwardingEvent, firstPageSize)
 				for i := range events {
@@ -223,9 +224,11 @@ func TestHandleProposeFees_Pagination(t *testing.T) {
 				}
 				return &lnrpc.ForwardingHistoryResponse{
 					ForwardingEvents: events,
-					LastOffsetIndex:  uint32(firstPageSize - 1),
+					LastOffsetIndex:  uint32(firstPageSize),
 				}, nil
 			}
+
+			require.Equal(t, uint32(firstPageSize), in.IndexOffset)
 			// Second page: return one more event to complete pagination.
 			return &lnrpc.ForwardingHistoryResponse{
 				ForwardingEvents: []*lnrpc.ForwardingEvent{
