@@ -213,14 +213,20 @@ type feeSetParams struct {
 	FeePpm   int64  `json:"fee_ppm"`
 }
 
+type rawFeeSetParams struct {
+	ChanID   *uint64 `json:"chan_id"`
+	BaseMsat *int64  `json:"base_msat"`
+	FeePpm   *int64  `json:"fee_ppm"`
+}
+
 type feeSetPolicyDelta struct {
 	ppmDelta    int64
 	baseChanged bool
 }
 
 func (d *Daemon) handleFeeSet(reqID string, raw json.RawMessage) Response {
-	var p feeSetParams
-	if err := json.Unmarshal(raw, &p); err != nil {
+	p, err := parseFeeSetParams(raw)
+	if err != nil {
 		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
 			"invalid params: "+err.Error()); recErr != nil {
 
@@ -252,6 +258,36 @@ func (d *Daemon) handleFeeSet(reqID string, raw json.RawMessage) Response {
 	}
 
 	return d.queueFeeSet(reqID, raw)
+}
+
+func parseFeeSetParams(raw json.RawMessage) (feeSetParams, error) {
+	var rawParams rawFeeSetParams
+	if err := json.Unmarshal(raw, &rawParams); err != nil {
+		return feeSetParams{}, err
+	}
+	if rawParams.ChanID == nil {
+		return feeSetParams{}, fmt.Errorf("missing chan_id")
+	}
+	if rawParams.BaseMsat == nil {
+		return feeSetParams{}, fmt.Errorf("missing base_msat")
+	}
+	if rawParams.FeePpm == nil {
+		return feeSetParams{}, fmt.Errorf("missing fee_ppm")
+	}
+	if *rawParams.ChanID == 0 {
+		return feeSetParams{}, fmt.Errorf("chan_id must be non-zero")
+	}
+	if *rawParams.BaseMsat < 0 {
+		return feeSetParams{}, fmt.Errorf("base_msat must be non-negative")
+	}
+	if *rawParams.FeePpm < 0 {
+		return feeSetParams{}, fmt.Errorf("fee_ppm must be non-negative")
+	}
+	return feeSetParams{
+		ChanID:   *rawParams.ChanID,
+		BaseMsat: *rawParams.BaseMsat,
+		FeePpm:   *rawParams.FeePpm,
+	}, nil
 }
 
 func removeStaleSocket(sockPath string) error {

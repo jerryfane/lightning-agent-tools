@@ -106,7 +106,7 @@ func TestDispatchRejectsOverCapAndLogs(t *testing.T) {
 
 	resp := d.dispatch(Request{
 		Action: "execute_fee_set",
-		Params: mustJSON(t, `{"chan_id":1,"old_ppm":100,"fee_ppm":250}`),
+		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"old_ppm":100,"fee_ppm":250}`),
 	})
 	if resp.Status != "error" {
 		t.Fatalf("expected error response, got %q", resp.Status)
@@ -131,7 +131,7 @@ func TestDispatchIgnoresCallerOldPpm(t *testing.T) {
 
 	resp := d.dispatch(Request{
 		Action: "execute_fee_set",
-		Params: mustJSON(t, `{"chan_id":1,"old_ppm":249,"fee_ppm":250}`),
+		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"old_ppm":249,"fee_ppm":250}`),
 	})
 	if resp.Status != "error" {
 		t.Fatalf("expected error response, got %+v", resp)
@@ -184,6 +184,20 @@ func TestDispatchBaseFeeChangeRequiresApproval(t *testing.T) {
 	}
 }
 
+func TestDispatchRejectsPartialFeeSetParams(t *testing.T) {
+	d := newTestDaemon(t, func(cfg *config.Config) {
+		cfg.Approval.RequireApproval = false
+	})
+
+	resp := d.dispatch(Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000}`),
+	})
+	if resp.Status != "error" || !strings.Contains(resp.Reason, "missing fee_ppm") {
+		t.Fatalf("expected missing fee_ppm rejection, got %+v", resp)
+	}
+}
+
 func TestDispatchRechecksKillSwitchBeforeExecution(t *testing.T) {
 	fake := newFakeExecutor(map[uint64]executor.FeePolicy{
 		1: {BaseMsat: 0, FeePpm: 100},
@@ -203,7 +217,7 @@ func TestDispatchRechecksKillSwitchBeforeExecution(t *testing.T) {
 
 	resp := d.dispatch(Request{
 		Action: "execute_fee_set",
-		Params: mustJSON(t, `{"chan_id":1,"fee_ppm":110}`),
+		Params: mustJSON(t, `{"chan_id":1,"base_msat":0,"fee_ppm":110}`),
 	})
 	if resp.Status != "error" || !strings.Contains(resp.Reason, "killswitch") {
 		t.Fatalf("expected killswitch rejection, got %+v", resp)
@@ -237,7 +251,7 @@ func TestDispatchKillSwitchHaltsAndLogs(t *testing.T) {
 
 	resp := d.dispatch(Request{
 		Action: "execute_fee_set",
-		Params: mustJSON(t, `{"chan_id":1,"old_ppm":100,"fee_ppm":101}`),
+		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"old_ppm":100,"fee_ppm":101}`),
 	})
 	if resp.Status != "error" || !strings.Contains(resp.Reason, "killswitch") {
 		t.Fatalf("expected killswitch error, got %+v", resp)
@@ -259,7 +273,7 @@ func TestDispatchQueuesPendingAndLogs(t *testing.T) {
 
 	resp := d.dispatch(Request{
 		Action: "execute_fee_set",
-		Params: mustJSON(t, `{"chan_id":42,"old_ppm":100,"fee_ppm":110}`),
+		Params: mustJSON(t, `{"chan_id":42,"base_msat":1000,"old_ppm":100,"fee_ppm":110}`),
 	})
 	if resp.Status != "pending" {
 		t.Fatalf("expected pending response, got %+v", resp)
