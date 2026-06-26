@@ -251,6 +251,24 @@ func TestCreateTestInvoice(t *testing.T) {
 	assert.Equal(t, int64(3600), invoice.Expiry)
 }
 
+// Test HealthService basic functionality.
+func TestHealthService_ToolCreation(t *testing.T) {
+	service := NewHealthService(nil)
+
+	t.Run("node_health_tool", func(t *testing.T) {
+		tool := service.NodeHealthTool()
+		assert.Equal(t, "lnc_node_health", tool.Name)
+		assert.Contains(t, tool.Description, "health")
+		schema := requireToolSchema(t, tool.InputSchema)
+		assert.Equal(t, "object", schema.Type)
+	})
+
+	t.Run("service_management", func(t *testing.T) {
+		assert.NotNil(t, service)
+		assert.Nil(t, service.LightningClient)
+	})
+}
+
 // Benchmark tests for performance.
 func BenchmarkInvoiceService_ListInvoicesTool(b *testing.B) {
 	service := NewInvoiceService(nil)
