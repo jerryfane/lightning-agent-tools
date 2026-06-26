@@ -43,7 +43,7 @@ graph TD
     KILL["kill-switch"]
     LEDGER[("SQLite audit ledger")]
   end
-  D -->|"node-ops scoped macaroon"| LND["watch-only lnd"]
+  D -->|"node-ops scoped macaroon<br/>+ daemon request checks"| LND["watch-only lnd"]
   LND -.signing.-> SIGNER["remote signer"]
 ```
 
@@ -57,15 +57,19 @@ graph TD
 2. **Language — Go.** Matches the existing `lightning-mcp-server` module; reuses its
    `lnrpc`/`routerrpc` client code and the macaroon-bakery output; one toolchain.
 
-3. **Transport — Unix-domain socket** at `~/.node-ops/daemon.sock` (mode `0600`),
-   length-prefixed JSON request/response (gRPC is an acceptable later swap). Local
-   only — never a TCP port. The MCP write tool sends `{action, params}`; the daemon
-   returns `{status, request_id, result|reason}`.
+3. **Transport — Unix-domain sockets.** MCP write clients use
+   `~/.node-ops/daemon.sock` (mode `0600`) with length-prefixed JSON
+   request/response (gRPC is an acceptable later swap). Operator approvals use a
+   separate operator-only socket/credential boundary. Local only — never a TCP port.
+   The MCP write tool sends `{action, params}`; the daemon returns
+   `{status, request_id, result|reason}`.
 
 4. **The daemon is the only holder of write authority.** It loads the **`node-ops`
-   scoped macaroon** (issue #7 — `UpdateChannelPolicy` + router self-pay only, *not*
-   admin) and the watch-only node connection. The MCP server and the agent never see
-   a write-capable credential.
+   scoped macaroon** (issue #7 — `UpdateChannelPolicy` + the minimum router RPCs
+   needed for circular rebalances, *not* admin) and the watch-only node connection.
+   lnd's URI-scoped macaroons do **not** encode "self-pay only"; self-payment is a
+   daemon-enforced request invariant before any router RPC is called. The MCP server
+   and the agent never see a write-capable credential.
 
 5. **Config — TOML** at `~/.node-ops/config.toml`. Limits are enforced from this
    file in code, not from the prompt:
@@ -89,6 +93,9 @@ graph TD
    [storage]
    ledger = "~/.node-ops/ledger.db"      # SQLite
    killswitch = "~/.node-ops/STOP"       # presence halts all execution
+
+   [operator]
+   approval_socket = "~/.node-ops/operator.sock"  # separate human/operator boundary
    ```
 
 6. **Ledger — SQLite** (`modernc.org/sqlite`, pure-Go, no CGO), an **INSERT-only**
@@ -99,10 +106,13 @@ graph TD
 7. **Approval — a pending queue, not a blocking prompt.** A money-affecting request
    above the auto-execute threshold is persisted as `pending` and surfaced
    conversationally; a human approves out-of-band through an operator-only surface
-   such as `node-ops approve <request_id>`. Approval is never exposed through the
-   same model-callable MCP session as write execution, so the agent cannot approve
-   its own request. **All** money-affecting actions pass the gate — closing the
-   ungated-fee-set hole in abacus/LNDg.
+   such as `node-ops approve <request_id>`. The daemon authenticates approvals on a
+   boundary unavailable to the MCP host/agent, for example a separate Unix socket
+   guarded by peer credentials for an operator UID/group, or an equivalent
+   human-only credential. Approval is never exposed through the same model-callable
+   MCP session or the same execution socket as write requests. **All**
+   money-affecting actions pass the gate — closing the ungated-fee-set hole in
+   abacus/LNDg.
 
 8. **Kill-switch — independent of any LLM turn.** Presence of the `killswitch` file
    (or a `--stop` daemon flag) makes the daemon reject every execution request
@@ -121,7 +131,8 @@ graph TD
 **Negative / costs**
 - An extra long-lived process to supervise (a `node-ops-daemon.service` systemd unit
   is part of #8).
-- IPC surface (the socket) to design and secure (`0600`, peer-cred check).
+- IPC surfaces (execution + operator approval) to design and secure (`0600`,
+  peer-cred check, separate operator boundary).
 - Daemon lifecycle/versioning must stay in lockstep with the MCP write-tool client.
 
 **Unlocks**
