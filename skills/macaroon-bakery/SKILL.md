@@ -20,7 +20,7 @@ skills/macaroon-bakery/scripts/bake.sh --role invoice-only
 # Bake a read-only macaroon
 skills/macaroon-bakery/scripts/bake.sh --role read-only
 
-# Bake a node-ops macaroon (fee management + circular self-pay)
+# Bake a node-ops macaroon (fee management + route-send rebalancing)
 skills/macaroon-bakery/scripts/bake.sh --role node-ops
 
 # Inspect any macaroon
@@ -70,7 +70,7 @@ with `macaroon:generate` permission (typically admin.macaroon).
 | `read-only` | Get info, balances, list channels/peers/payments | Pay, create invoices, open/close channels |
 | `channel-admin` | All of read-only + open/close channels, connect peers | Pay invoices, create invoices, set fees |
 | `signer-only` | Sign transactions, derive keys (for remote signer) | Everything else |
-| `node-ops` | Set channel fees (`UpdateChannelPolicy`), circular self-pay for rebalancing (`SendToRouteV2`, `BuildRoute`), query routes, read node/channel state | Open/close channels, pay external invoices, create invoices |
+| `node-ops` | Set channel fees (`UpdateChannelPolicy`), build/query routes, use `SendToRouteV2` for daemon-checked rebalancing, read node/channel state | Open/close channels, create invoices, use high-level payment RPCs (`SendPaymentSync`, `SendPaymentV2`) |
 
 ## Baking Custom Macaroons
 
@@ -117,19 +117,28 @@ skills/macaroon-bakery/scripts/bake.sh --inspect ~/.lnd/data/chain/bitcoin/mainn
 ## Node-Ops Macaroon
 
 The `node-ops` role is for automated routing agents that need to tune fees and
-rebalance channels without holding admin-level trust.
+rebalance channels without holding admin-level trust. It is designed to be held
+by the governance daemon, not by a general-purpose agent.
+
+Important: lnd URI-scoped macaroons cannot express "self-pay only". This preset
+grants route construction and `SendToRouteV2`; the daemon or caller must enforce
+the circular route, payment hash, amount, fee, and peer boundaries before using
+those RPCs.
 
 **What it can do:**
 - Set channel routing fees (`UpdateChannelPolicy`)
-- Send circular self-payments for rebalancing (`BuildRoute` + `SendToRouteV2`)
+- Send along explicitly constructed routes for daemon-checked rebalancing
+  (`BuildRoute` + `SendToRouteV2`)
 - Query routes for probing (`QueryRoutes`)
 - Read node state (info, balances, channels)
 
 **What it cannot do:**
 - Open or close channels
-- Pay external invoices (`SendPaymentSync` / `SendPaymentV2` are excluded)
+- Use high-level payment RPCs (`SendPaymentSync` / `SendPaymentV2` are excluded)
 - Create invoices
 - Connect or disconnect peers
+- Reset mission control state (`ResetMissionControl` is excluded because it
+  mutates global pathfinding history)
 
 ```bash
 # Bake a node-ops macaroon (local node)
@@ -142,11 +151,11 @@ skills/macaroon-bakery/scripts/bake.sh --role node-ops --container litd
 skills/macaroon-bakery/scripts/bake.sh --inspect ~/.lnd/data/chain/bitcoin/testnet/node-ops.macaroon
 ```
 
-The key difference from `channel-admin`: node-ops agents can set fees and
-self-pay for rebalancing but cannot open or close channels. The key difference
-from `pay-only`: node-ops agents can manage routing policy but cannot pay
-arbitrary external invoices — `SendToRouteV2` requires you to construct the
-exact route, making accidental external payments unlikely.
+The key difference from `channel-admin`: node-ops agents can set fees and use
+route-send primitives for rebalancing but cannot open or close channels. The key
+difference from `pay-only`: node-ops excludes high-level invoice payment RPCs,
+but `SendToRouteV2` is still a payment primitive. Treat this macaroon as a
+daemon credential and enforce self-payment constraints in daemon logic.
 
 ## Signer Macaroon Scoping
 
@@ -212,7 +221,7 @@ skills/lnd/scripts/lncli.sh bakemacaroon --root_key_id 0
 | `uri:/lnrpc.Lightning/CloseChannel` | Close a channel |
 | `uri:/lnrpc.Lightning/UpdateChannelPolicy` | Set routing fees for channels |
 | `uri:/lnrpc.Lightning/QueryRoutes` | Query routes between nodes |
-| `uri:/routerrpc.Router/SendToRouteV2` | Send along an explicitly constructed route (circular self-pay) |
+| `uri:/routerrpc.Router/SendToRouteV2` | Send along an explicitly constructed route; callers must enforce self-payment constraints |
 | `uri:/routerrpc.Router/BuildRoute` | Build a route from a list of hops |
 | `uri:/routerrpc.Router/ResetMissionControl` | Reset payment attempt history |
 | `uri:/signrpc.Signer/SignOutputRaw` | Sign a transaction output |

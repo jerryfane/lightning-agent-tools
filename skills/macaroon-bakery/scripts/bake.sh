@@ -271,8 +271,12 @@ if [ -n "$ROLE" ]; then
             )
             ;;
         node-ops)
-            # Fee management + circular self-pay (rebalancing). Cannot open/close
-            # channels or pay external invoices — use channel-admin or pay-only for those.
+            # Fee management + route-send primitives for rebalancing. Cannot
+            # open/close channels or use high-level invoice payment RPCs.
+            # ResetMissionControl is excluded because it mutates global routing
+            # history outside a bounded fee/rebalance action.
+            # lnd macaroons cannot enforce "self-pay only"; daemon logic must
+            # validate route/payment boundaries before using SendToRouteV2.
             PERMS=(
                 "uri:/lnrpc.Lightning/GetInfo"
                 "uri:/lnrpc.Lightning/WalletBalance"
@@ -285,7 +289,6 @@ if [ -n "$ROLE" ]; then
                 "uri:/lnrpc.Lightning/QueryRoutes"
                 "uri:/routerrpc.Router/SendToRouteV2"
                 "uri:/routerrpc.Router/BuildRoute"
-                "uri:/routerrpc.Router/ResetMissionControl"
                 "uri:/verrpc.Versioner/GetVersion"
             )
             ;;
