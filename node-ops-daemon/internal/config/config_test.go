@@ -6,6 +6,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -59,5 +60,42 @@ killswitch = "~/.node-ops/CUSTOM_STOP"
 	}
 	if want := filepath.Join(home, ".node-ops", "CUSTOM_STOP"); cfg.Storage.KillswitchFile != want {
 		t.Fatalf("killswitch path = %q, want %q", cfg.Storage.KillswitchFile, want)
+	}
+}
+
+func TestLoadRejectsEmptyStoragePaths(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{
+			name: "ledger",
+			body: `
+	[storage]
+	ledger = ""
+	`,
+			wantErr: "storage.ledger",
+		},
+		{
+			name: "killswitch",
+			body: `
+	[storage]
+	killswitch = " "
+	`,
+			wantErr: "storage.killswitch",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(tc.body), 0600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+
+			_, err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected %q error, got %v", tc.wantErr, err)
+			}
+		})
 	}
 }

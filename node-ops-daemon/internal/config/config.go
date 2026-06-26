@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 )
@@ -92,6 +93,9 @@ func Load(path string) (*Config, error) {
 	if err := c.expand(); err != nil {
 		return nil, err
 	}
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
 	return c, nil
 }
 
@@ -103,6 +107,16 @@ func (c *Config) expand() error {
 	}
 	c.Storage.LedgerPath = expandHome(c.Storage.LedgerPath, home)
 	c.Storage.KillswitchFile = expandHome(c.Storage.KillswitchFile, home)
+	return nil
+}
+
+func (c *Config) validate() error {
+	if strings.TrimSpace(c.Storage.LedgerPath) == "" {
+		return fmt.Errorf("storage.ledger must not be empty")
+	}
+	if strings.TrimSpace(c.Storage.KillswitchFile) == "" {
+		return fmt.Errorf("storage.killswitch must not be empty")
+	}
 	return nil
 }
 
