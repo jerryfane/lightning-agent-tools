@@ -10,7 +10,10 @@ import (
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/limits"
 )
 
-const maxInt64 = int64(1<<63 - 1)
+const (
+	maxInt64 = int64(1<<63 - 1)
+	minInt64 = -maxInt64 - 1
+)
 
 func newEngine(t *testing.T, cfg config.Limits) *limits.Engine {
 	t.Helper()
@@ -41,6 +44,9 @@ func TestCheckFeeDelta_ExceedsCap(t *testing.T) {
 	}
 	if err := eng.CheckFeeDelta(-101); err == nil {
 		t.Error("expected error for negative delta exceeding cap")
+	}
+	if err := eng.CheckFeeDelta(minInt64); err == nil {
+		t.Error("expected error for minimum int64 delta")
 	}
 }
 

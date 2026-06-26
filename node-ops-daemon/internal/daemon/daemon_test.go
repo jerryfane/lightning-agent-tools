@@ -259,6 +259,44 @@ func TestDispatchRechecksKillSwitchBeforeQueueing(t *testing.T) {
 	}
 }
 
+func TestDispatchRechecksKillSwitchBeforeFallbackQueueing(t *testing.T) {
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{
+		1: {BaseMsat: 1_000, FeePpm: 100},
+	})
+	d := newTestDaemonWithExecutor(t, func(cfg *config.Config) {
+		cfg.Approval.RequireApproval = false
+	}, fake)
+
+	var calls int
+	fake.onCurrent = func() {
+		calls++
+		switch calls {
+		case 1:
+			fake.mu.Lock()
+			fake.current[1] = executor.FeePolicy{BaseMsat: 999, FeePpm: 100}
+			fake.mu.Unlock()
+		case 2:
+			if err := os.WriteFile(d.cfg.Storage.KillswitchFile, []byte("stop"), 0600); err != nil {
+				t.Fatalf("write killswitch: %v", err)
+			}
+		}
+	}
+
+	resp := d.dispatch(Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"fee_ppm":110}`),
+	})
+	if resp.Status != "error" || !strings.Contains(resp.Reason, "killswitch") {
+		t.Fatalf("expected killswitch rejection, got %+v", resp)
+	}
+	if pending := d.queue.ListPending(); len(pending) != 0 {
+		t.Fatalf("request queued despite kill-switch: %+v", pending)
+	}
+	if len(fake.executed) != 0 {
+		t.Fatalf("request executed despite kill-switch: %+v", fake.executed)
+	}
+}
+
 func TestRunRefusesActiveSocket(t *testing.T) {
 	d := newTestDaemon(t, nil)
 	sockPath := filepath.Join(t.TempDir(), "daemon.sock")

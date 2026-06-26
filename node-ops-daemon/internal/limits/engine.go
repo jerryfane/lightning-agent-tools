@@ -13,7 +13,10 @@ import (
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/config"
 )
 
-const maxInt64 = int64(1<<63 - 1)
+const (
+	maxInt64 = int64(1<<63 - 1)
+	minInt64 = -maxInt64 - 1
+)
 
 // Engine enforces per-day rebalance budgets, per-ppm-delta caps, per-channel
 // cooldowns, and maximum rebalance fee rates.
@@ -44,6 +47,10 @@ func New(cfg config.Limits) (*Engine, error) {
 
 // CheckFeeDelta returns an error if |deltaPpm| exceeds MaxFeePpmDelta.
 func (e *Engine) CheckFeeDelta(deltaPpm int64) error {
+	if deltaPpm == minInt64 {
+		return fmt.Errorf("fee delta overflows absolute value and exceeds max_fee_ppm_delta %d",
+			e.cfg.MaxFeePpmDelta)
+	}
 	if deltaPpm < 0 {
 		deltaPpm = -deltaPpm
 	}

@@ -200,6 +200,24 @@ func (d *Daemon) statusResult() map[string]string {
 	return map[string]string{"state": "running", "killswitch": "inactive"}
 }
 
+func (d *Daemon) rejectIfKillSwitchActive(reqID, action string,
+	raw json.RawMessage) (Response, bool) {
+
+	if !killswitch.Active(d.cfg.Storage.KillswitchFile) {
+		return Response{}, false
+	}
+	if recErr := d.record(reqID, action, raw, "rejected",
+		"killswitch active"); recErr != nil {
+
+		return ledgerFailure(reqID, recErr), true
+	}
+	return Response{
+		Status:    "error",
+		RequestID: reqID,
+		Reason:    "killswitch active: all execution is halted",
+	}, true
+}
+
 // feeSetParams are the parameters for the execute_fee_set action.
 type feeSetParams struct {
 	ChanID   uint64 `json:"chan_id"`
@@ -219,17 +237,10 @@ type feeSetPolicyDelta struct {
 }
 
 func (d *Daemon) handleFeeSet(reqID string, raw json.RawMessage) Response {
-	if killswitch.Active(d.cfg.Storage.KillswitchFile) {
-		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
-			"killswitch active"); recErr != nil {
+	if resp, stopped := d.rejectIfKillSwitchActive(reqID, "execute_fee_set",
+		raw); stopped {
 
-			return ledgerFailure(reqID, recErr)
-		}
-		return Response{
-			Status:    "error",
-			RequestID: reqID,
-			Reason:    "killswitch active: all execution is halted",
-		}
+		return resp
 	}
 
 	p, err := parseFeeSetParams(raw)
@@ -264,17 +275,10 @@ func (d *Daemon) handleFeeSet(reqID string, raw json.RawMessage) Response {
 		return d.executeFeeSet(reqID, raw, p)
 	}
 
-	if killswitch.Active(d.cfg.Storage.KillswitchFile) {
-		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
-			"killswitch active"); recErr != nil {
+	if resp, stopped := d.rejectIfKillSwitchActive(reqID, "execute_fee_set",
+		raw); stopped {
 
-			return ledgerFailure(reqID, recErr)
-		}
-		return Response{
-			Status:    "error",
-			RequestID: reqID,
-			Reason:    "killswitch active: all execution is halted",
-		}
+		return resp
 	}
 	return d.queueFeeSet(reqID, raw)
 }
@@ -429,6 +433,11 @@ func (d *Daemon) executeFeeSet(reqID string, raw json.RawMessage,
 		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
 	}
 	if d.needsApproval(delta) {
+		if resp, stopped := d.rejectIfKillSwitchActive(reqID, "execute_fee_set",
+			raw); stopped {
+
+			return resp
+		}
 		return d.queueFeeSet(reqID, raw)
 	}
 	if err := d.limits.CheckChannelCooldown(p.ChanID); err != nil {
@@ -439,17 +448,10 @@ func (d *Daemon) executeFeeSet(reqID string, raw json.RawMessage,
 		}
 		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
 	}
-	if killswitch.Active(d.cfg.Storage.KillswitchFile) {
-		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
-			"killswitch active"); recErr != nil {
+	if resp, stopped := d.rejectIfKillSwitchActive(reqID, "execute_fee_set",
+		raw); stopped {
 
-			return ledgerFailure(reqID, recErr)
-		}
-		return Response{
-			Status:    "error",
-			RequestID: reqID,
-			Reason:    "killswitch active: all execution is halted",
-		}
+		return resp
 	}
 	if err := d.record(reqID, "execute_fee_set", raw, "accepted", ""); err != nil {
 		return ledgerFailure(reqID, err)
