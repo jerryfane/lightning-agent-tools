@@ -15,11 +15,12 @@ import (
 )
 
 const (
-	defaultRebalanceThreshold    = 0.65
+	defaultRebalanceThreshold     = 0.65
 	defaultMaxRebalanceCandidates = 10
-	defaultRebalanceMaxFeePPM    = 500
-	minRebalanceAmountSat        = 20_000
-	fwdHistoryLookbackDays       = 30
+	defaultRebalanceMaxFeePPM     = 500
+	minRebalanceAmountSat         = 20_000
+	fwdHistoryLookbackDays        = 30
+	rebalanceHistoryPageSize      = 50_000
 )
 
 // rebalanceClient is the narrow read-only interface used by RebalanceService.
@@ -160,7 +161,7 @@ func (s *RebalanceService) HandleProposeRebalance(ctx context.Context,
 		}
 	}
 
-	sortSnapshots(overLocal, true)  // descending: most over-local first
+	sortSnapshots(overLocal, true)   // descending: most over-local first
 	sortSnapshots(overRemote, false) // ascending: most over-remote first
 
 	type rebalanceCandidate struct {
@@ -235,22 +236,38 @@ func (s *RebalanceService) forwardingNetFlow(
 	ctx context.Context) map[uint64]int64 {
 
 	now := time.Now()
-	resp, err := s.LightningClient.ForwardingHistory(ctx,
-		&lnrpc.ForwardingHistoryRequest{
-			StartTime: uint64(
-				now.Add(-fwdHistoryLookbackDays * 24 * time.Hour).Unix(),
-			),
-			EndTime:      uint64(now.Unix()),
-			NumMaxEvents: 50_000,
-		},
+	startTime := uint64(
+		now.Add(-fwdHistoryLookbackDays * 24 * time.Hour).Unix(),
 	)
-	if err != nil {
-		return map[uint64]int64{}
-	}
-	net := make(map[uint64]int64, len(resp.ForwardingEvents))
-	for _, ev := range resp.ForwardingEvents {
-		net[ev.ChanIdOut] += int64(ev.AmtOut)
-		net[ev.ChanIdIn] -= int64(ev.AmtIn)
+	endTime := uint64(now.Unix())
+
+	net := make(map[uint64]int64)
+	var offset uint32
+	for {
+		resp, err := s.LightningClient.ForwardingHistory(ctx,
+			&lnrpc.ForwardingHistoryRequest{
+				StartTime:    startTime,
+				EndTime:      endTime,
+				NumMaxEvents: rebalanceHistoryPageSize,
+				IndexOffset:  offset,
+			},
+		)
+		if err != nil {
+			return map[uint64]int64{}
+		}
+		for _, ev := range resp.ForwardingEvents {
+			net[ev.ChanIdOut] += int64(ev.AmtOut)
+			net[ev.ChanIdIn] -= int64(ev.AmtIn)
+		}
+
+		if uint32(len(resp.ForwardingEvents)) < rebalanceHistoryPageSize {
+			break
+		}
+		nextOffset := resp.LastOffsetIndex
+		if nextOffset == offset {
+			break
+		}
+		offset = nextOffset
 	}
 	return net
 }
@@ -274,7 +291,7 @@ func snapsToMaps(snaps []chanSnapshot, includeFwd bool) []map[string]any {
 	out := make([]map[string]any, len(snaps))
 	for i, sn := range snaps {
 		m := map[string]any{
-			"chan_id":         sn.chanIDStr,
+			"chan_id":        sn.chanIDStr,
 			"remote_pubkey":  sn.remotePub,
 			"capacity":       sn.capacity,
 			"local_balance":  sn.local,

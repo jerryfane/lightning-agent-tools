@@ -19,9 +19,11 @@ import (
 // stubRebalanceClient is a minimal test double for the rebalanceClient
 // interface.
 type stubRebalanceClient struct {
-	channels []*lnrpc.Channel
-	fwdErr   bool
-	fwdEvents []*lnrpc.ForwardingEvent
+	channels     []*lnrpc.Channel
+	fwdErr       bool
+	fwdEvents    []*lnrpc.ForwardingEvent
+	fwdResponses []*lnrpc.ForwardingHistoryResponse
+	fwdRequests  []*lnrpc.ForwardingHistoryRequest
 }
 
 func (s *stubRebalanceClient) ListChannels(_ context.Context,
@@ -31,10 +33,23 @@ func (s *stubRebalanceClient) ListChannels(_ context.Context,
 }
 
 func (s *stubRebalanceClient) ForwardingHistory(_ context.Context,
-	_ *lnrpc.ForwardingHistoryRequest,
+	req *lnrpc.ForwardingHistoryRequest,
 	_ ...grpc.CallOption) (*lnrpc.ForwardingHistoryResponse, error) {
 	if s.fwdErr {
 		return nil, errors.New("unavailable")
+	}
+	s.fwdRequests = append(s.fwdRequests, &lnrpc.ForwardingHistoryRequest{
+		StartTime:    req.StartTime,
+		EndTime:      req.EndTime,
+		NumMaxEvents: req.NumMaxEvents,
+		IndexOffset:  req.IndexOffset,
+	})
+	if len(s.fwdResponses) > 0 {
+		idx := len(s.fwdRequests) - 1
+		if idx < len(s.fwdResponses) {
+			return s.fwdResponses[idx], nil
+		}
+		return &lnrpc.ForwardingHistoryResponse{}, nil
 	}
 	return &lnrpc.ForwardingHistoryResponse{
 		ForwardingEvents: s.fwdEvents,
@@ -237,6 +252,64 @@ func TestRebalanceService_ForwardingDemandEnrichment(t *testing.T) {
 	assert.Contains(t, reason, "urgent", "demand pressure should mark candidate as urgent")
 }
 
+func TestRebalanceService_ForwardingDemandPagination(t *testing.T) {
+	firstPage := make([]*lnrpc.ForwardingEvent, rebalanceHistoryPageSize)
+	for i := range firstPage {
+		firstPage[i] = &lnrpc.ForwardingEvent{
+			ChanIdIn: 1,
+			AmtIn:    1,
+		}
+	}
+	stub := &stubRebalanceClient{
+		channels: []*lnrpc.Channel{
+			{
+				ChanId: 1, Capacity: 2_000_000,
+				LocalBalance: 1_600_000, RemoteBalance: 400_000,
+				RemotePubkey: "aaa",
+			},
+			{
+				ChanId: 2, Capacity: 2_000_000,
+				LocalBalance: 400_000, RemoteBalance: 1_600_000,
+				RemotePubkey: "bbb",
+			},
+		},
+		fwdResponses: []*lnrpc.ForwardingHistoryResponse{
+			{
+				ForwardingEvents: firstPage,
+				LastOffsetIndex:  rebalanceHistoryPageSize,
+			},
+			{
+				ForwardingEvents: []*lnrpc.ForwardingEvent{
+					{
+						ChanIdIn: 1,
+						AmtIn:    1,
+					},
+				},
+				LastOffsetIndex: rebalanceHistoryPageSize,
+			},
+		},
+	}
+	svc := NewRebalanceService(stub)
+
+	result, err := svc.HandleProposeRebalance(
+		context.Background(),
+		makeRebalanceReq(t, map[string]any{"include_forwarding_demand": true}),
+	)
+	require.NoError(t, err)
+	require.False(t, result.IsError)
+
+	require.Len(t, stub.fwdRequests, 2)
+	assert.Equal(t, uint32(0), stub.fwdRequests[0].IndexOffset)
+	assert.Equal(t, uint32(rebalanceHistoryPageSize), stub.fwdRequests[1].IndexOffset)
+
+	out := unmarshalResult(t, result)
+	analysis := out["analysis"].(map[string]any)
+	overLocal := analysis["over_local_channels"].([]any)
+	require.Len(t, overLocal, 1)
+	assert.Equal(t, float64(-(rebalanceHistoryPageSize + 1)),
+		overLocal[0].(map[string]any)["fwd_net_flow_sat"])
+}
+
 func TestRebalanceService_ForwardingHistoryError(t *testing.T) {
 	// A ForwardingHistory failure must not break the response.
 	stub := &stubRebalanceClient{
@@ -286,7 +359,7 @@ func TestRebalanceService_MaxCandidatesRespected(t *testing.T) {
 	result, err := svc.HandleProposeRebalance(
 		context.Background(),
 		makeRebalanceReq(t, map[string]any{
-			"max_candidates":           2,
+			"max_candidates":            2,
 			"include_forwarding_demand": false,
 		}),
 	)
