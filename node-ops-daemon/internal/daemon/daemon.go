@@ -61,8 +61,8 @@ func New(cfg *config.Config, exec executor.NodeExecutor) (*Daemon, error) {
 	if err != nil {
 		return nil, fmt.Errorf("limits engine: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(cfg.Storage.LedgerPath), 0700); err != nil {
-		return nil, fmt.Errorf("create ledger dir: %w", err)
+	if err := prepareLedgerDir(filepath.Dir(cfg.Storage.LedgerPath)); err != nil {
+		return nil, err
 	}
 	l, err := ledger.Open(cfg.Storage.LedgerPath)
 	if err != nil {
@@ -140,23 +140,10 @@ func (d *Daemon) handleConn(conn net.Conn) {
 	}
 }
 
-// dispatch routes a request to the appropriate handler and enforces the
-// kill-switch before any execution.
+// dispatch routes a request to the appropriate handler. Write handlers enforce
+// the kill-switch before execution; read-only status/inspection remains visible.
 func (d *Daemon) dispatch(req Request) Response {
 	reqID := uuid.New().String()
-
-	if killswitch.Active(d.cfg.Storage.KillswitchFile) {
-		if err := d.record(reqID, req.Action, req.Params, "rejected",
-			"killswitch active"); err != nil {
-
-			return ledgerFailure(reqID, err)
-		}
-		return Response{
-			Status:    "error",
-			RequestID: reqID,
-			Reason:    "killswitch active: all execution is halted",
-		}
-	}
 
 	switch req.Action {
 	case "execute_fee_set":
@@ -170,7 +157,7 @@ func (d *Daemon) dispatch(req Request) Response {
 		return Response{
 			Status:    "ok",
 			RequestID: reqID,
-			Result:    map[string]string{"state": "running"},
+			Result:    d.statusResult(),
 		}
 	default:
 		reason := fmt.Sprintf("unknown action: %q", req.Action)
@@ -206,6 +193,13 @@ func ledgerFailure(reqID string, err error) Response {
 	}
 }
 
+func (d *Daemon) statusResult() map[string]string {
+	if killswitch.Active(d.cfg.Storage.KillswitchFile) {
+		return map[string]string{"state": "stopped", "killswitch": "active"}
+	}
+	return map[string]string{"state": "running", "killswitch": "inactive"}
+}
+
 // feeSetParams are the parameters for the execute_fee_set action.
 type feeSetParams struct {
 	ChanID   uint64 `json:"chan_id"`
@@ -225,6 +219,19 @@ type feeSetPolicyDelta struct {
 }
 
 func (d *Daemon) handleFeeSet(reqID string, raw json.RawMessage) Response {
+	if killswitch.Active(d.cfg.Storage.KillswitchFile) {
+		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
+			"killswitch active"); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{
+			Status:    "error",
+			RequestID: reqID,
+			Reason:    "killswitch active: all execution is halted",
+		}
+	}
+
 	p, err := parseFeeSetParams(raw)
 	if err != nil {
 		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
@@ -290,35 +297,43 @@ func parseFeeSetParams(raw json.RawMessage) (feeSetParams, error) {
 	}, nil
 }
 
+func prepareLedgerDir(dir string) error {
+	return preparePrivateDir("ledger", dir)
+}
+
 func prepareSocketDir(dir string) error {
+	return preparePrivateDir("socket", dir)
+}
+
+func preparePrivateDir(kind, dir string) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("create socket dir: %w", err)
+		return fmt.Errorf("create %s dir: %w", kind, err)
 	}
 	info, err := os.Lstat(dir)
 	if err != nil {
-		return fmt.Errorf("stat socket dir %s: %w", dir, err)
+		return fmt.Errorf("stat %s dir %s: %w", kind, dir, err)
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("socket dir %s must not be a symlink", dir)
+		return fmt.Errorf("%s dir %s must not be a symlink", kind, dir)
 	}
 	if !info.IsDir() {
-		return fmt.Errorf("socket dir %s is not a directory", dir)
+		return fmt.Errorf("%s dir %s is not a directory", kind, dir)
 	}
-	if err := checkSocketDirOwner(dir, info); err != nil {
+	if err := checkPrivateDirOwner(kind, dir, info); err != nil {
 		return err
 	}
 	if info.Mode().Perm()&0077 == 0 {
 		return nil
 	}
 	if err := os.Chmod(dir, 0700); err != nil {
-		return fmt.Errorf("secure socket dir %s: %w", dir, err)
+		return fmt.Errorf("secure %s dir %s: %w", kind, dir, err)
 	}
 	info, err = os.Stat(dir)
 	if err != nil {
-		return fmt.Errorf("stat socket dir %s: %w", dir, err)
+		return fmt.Errorf("stat %s dir %s: %w", kind, dir, err)
 	}
 	if info.Mode().Perm()&0077 != 0 {
-		return fmt.Errorf("socket dir %s has unsafe permissions %03o", dir, info.Mode().Perm())
+		return fmt.Errorf("%s dir %s has unsafe permissions %03o", kind, dir, info.Mode().Perm())
 	}
 	return nil
 }

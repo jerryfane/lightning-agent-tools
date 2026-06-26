@@ -7,6 +7,6 @@ package daemon
 
 import "os"
 
-func checkSocketDirOwner(_ string, _ os.FileInfo) error {
+func checkPrivateDirOwner(_ string, _ string, _ os.FileInfo) error {
 	return nil
 }

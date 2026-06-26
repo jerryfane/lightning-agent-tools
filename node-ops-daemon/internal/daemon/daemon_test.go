@@ -15,6 +15,7 @@ import (
 
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/config"
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/executor"
+	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/queue"
 )
 
 func newTestDaemon(t *testing.T, mutate func(*config.Config)) *Daemon {
@@ -265,6 +266,31 @@ func TestPrepareSocketDirSecuresExistingDirectory(t *testing.T) {
 	}
 }
 
+func TestNewSecuresExistingLedgerDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "ledger")
+	if err := os.Mkdir(dir, 0777); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+
+	d := newTestDaemon(t, func(cfg *config.Config) {
+		cfg.Storage.LedgerPath = filepath.Join(dir, "ledger.db")
+	})
+	if d == nil {
+		t.Fatal("expected daemon")
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if info.Mode().Perm()&0077 != 0 {
+		t.Fatalf("ledger dir still allows group/other access: %03o",
+			info.Mode().Perm())
+	}
+}
+
 func TestRemoveStaleSocketRejectsNonSocketPaths(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -344,6 +370,38 @@ func TestDispatchKillSwitchHaltsAndLogs(t *testing.T) {
 		entries[0].Reason != "killswitch active" {
 
 		t.Fatalf("unexpected ledger entries: %+v", entries)
+	}
+}
+
+func TestReadOnlyActionsContinueDuringKillSwitch(t *testing.T) {
+	d := newTestDaemon(t, nil)
+	queued := d.dispatch(Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":42,"base_msat":1000,"fee_ppm":110}`),
+	})
+	if queued.Status != "pending" {
+		t.Fatalf("expected pending setup response, got %+v", queued)
+	}
+	if err := os.WriteFile(d.cfg.Storage.KillswitchFile, []byte("stop"), 0600); err != nil {
+		t.Fatalf("write killswitch: %v", err)
+	}
+
+	status := d.dispatch(Request{Action: "status"})
+	if status.Status != "ok" {
+		t.Fatalf("expected status during killswitch, got %+v", status)
+	}
+	result, ok := status.Result.(map[string]string)
+	if !ok || result["state"] != "stopped" || result["killswitch"] != "active" {
+		t.Fatalf("expected active killswitch status, got %#v", status.Result)
+	}
+
+	pending := d.dispatch(Request{Action: "list_pending"})
+	if pending.Status != "ok" {
+		t.Fatalf("expected list_pending during killswitch, got %+v", pending)
+	}
+	items, ok := pending.Result.([]queue.Item)
+	if !ok || len(items) != 1 {
+		t.Fatalf("expected one pending item during killswitch, got %#v", pending.Result)
 	}
 }
 
