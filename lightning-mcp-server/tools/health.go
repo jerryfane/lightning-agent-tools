@@ -47,7 +47,7 @@ func (s *HealthService) HandleNodeHealth(ctx context.Context,
 				"Use lnc_connect first."), nil
 	}
 
-	var alerts []map[string]any
+	alerts := make([]map[string]any, 0)
 
 	// --- sync status (from GetInfo) ---
 	info, err := s.LightningClient.GetInfo(ctx, &lnrpc.GetInfoRequest{})

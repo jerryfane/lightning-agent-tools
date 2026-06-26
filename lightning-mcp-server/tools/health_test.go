@@ -54,6 +54,33 @@ func decodeHealthResult(t *testing.T,
 	return out
 }
 
+func TestHealthService_HealthyAlertsAreEmptyArray(t *testing.T) {
+	svc := NewHealthService(&mockHealthClient{
+		info: &lnrpc.GetInfoResponse{
+			IdentityPubkey: "node",
+			Alias:          "test-node",
+			SyncedToChain:  true,
+			SyncedToGraph:  true,
+			BlockHeight:    42,
+		},
+		pending: &lnrpc.PendingChannelsResponse{},
+		peers:   &lnrpc.ListPeersResponse{},
+	})
+
+	result, err := svc.HandleNodeHealth(
+		context.Background(), &mcp.CallToolRequest{},
+	)
+	require.NoError(t, err)
+	require.False(t, result.IsError)
+
+	out := decodeHealthResult(t, result)
+	assert.Equal(t, "healthy", out["overall_status"])
+	assert.Equal(t, float64(0), out["alert_count"])
+	alerts, ok := out["alerts"].([]any)
+	require.True(t, ok)
+	assert.Empty(t, alerts)
+}
+
 func TestHealthService_CriticalAlertsArePrioritized(t *testing.T) {
 	svc := NewHealthService(&mockHealthClient{
 		info: &lnrpc.GetInfoResponse{
