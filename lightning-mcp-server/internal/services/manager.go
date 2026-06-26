@@ -28,13 +28,17 @@ type Manager struct {
 	lightningClient lnrpc.LightningClient
 
 	// Services - read-only operations only.
-	connectionService *tools.ConnectionService
-	invoiceService    *tools.InvoiceService
-	channelService    *tools.ChannelService
-	paymentService    *tools.PaymentService
-	onchainService    *tools.OnChainService
-	peerService       *tools.PeerService
-	nodeService       *tools.NodeService
+	connectionService     *tools.ConnectionService
+	invoiceService        *tools.InvoiceService
+	channelService        *tools.ChannelService
+	channelActionsService *tools.ChannelActionsService
+	paymentService        *tools.PaymentService
+	onchainService        *tools.OnChainService
+	peerService           *tools.PeerService
+	nodeService           *tools.NodeService
+	healthService         *tools.HealthService
+	rebalanceService      *tools.RebalanceService
+	feeService            *tools.FeeService
 }
 
 // NewManager creates a new service manager for read-only operations.
@@ -56,10 +60,14 @@ func (m *Manager) InitializeServices() {
 	// Initialize all read-only services with nil clients.
 	m.invoiceService = tools.NewInvoiceService(nil)
 	m.channelService = tools.NewChannelService(nil)
+	m.channelActionsService = tools.NewChannelActionsService(nil)
 	m.paymentService = tools.NewPaymentService(nil)
 	m.onchainService = tools.NewOnChainService(nil)
 	m.peerService = tools.NewPeerService(nil)
 	m.nodeService = tools.NewNodeService(nil)
+	m.healthService = tools.NewHealthService(nil)
+	m.rebalanceService = tools.NewRebalanceService(nil)
+	m.feeService = tools.NewFeeService(nil)
 
 	m.logger.Info("Read-only services initialized successfully")
 }
@@ -99,6 +107,8 @@ func (m *Manager) RegisterTools(mcpServer interfaces.MCPServer) error {
 		m.channelService.HandleListChannels)
 	register(m.channelService.PendingChannelsTool(),
 		m.channelService.HandlePendingChannels)
+	register(m.channelActionsService.ProposeChannelActionsTool(),
+		m.channelActionsService.HandleProposeChannelActions)
 
 	// Payment tools - read-only operations.
 	register(m.paymentService.ListPaymentsTool(),
@@ -128,6 +138,18 @@ func (m *Manager) RegisterTools(mcpServer interfaces.MCPServer) error {
 	register(m.nodeService.GetInfoTool(),
 		m.nodeService.HandleGetInfo)
 
+	// Health tools - read-only operations.
+	register(m.healthService.NodeHealthTool(),
+		m.healthService.HandleNodeHealth)
+
+	// Rebalance tools - read-only proposal only, no funds movement.
+	register(m.rebalanceService.ProposeRebalanceTool(),
+		m.rebalanceService.HandleProposeRebalance)
+
+	// Fee proposal tool - read-only operations.
+	register(m.feeService.ProposeFeesTool(),
+		m.feeService.HandleProposeFees)
+
 	m.logger.Info("Read-only MCP tools registered",
 		zap.Int("total_tools", registrations))
 	return nil
@@ -145,10 +167,14 @@ func (m *Manager) onLNCConnectionEstablished(conn *grpc.ClientConn) {
 	// Update existing read-only services with new connection.
 	m.invoiceService.LightningClient = m.lightningClient
 	m.channelService.LightningClient = m.lightningClient
+	m.channelActionsService.LightningClient = m.lightningClient
 	m.paymentService.LightningClient = m.lightningClient
 	m.onchainService.LightningClient = m.lightningClient
 	m.peerService.LightningClient = m.lightningClient
 	m.nodeService.LightningClient = m.lightningClient
+	m.healthService.LightningClient = m.lightningClient
+	m.rebalanceService.LightningClient = m.lightningClient
+	m.feeService.LightningClient = m.lightningClient
 
 	logger.Info("All read-only services updated with new connection")
 }

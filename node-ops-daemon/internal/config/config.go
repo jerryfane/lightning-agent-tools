@@ -45,7 +45,7 @@ type Storage struct {
 	LedgerPath string `toml:"ledger"`
 
 	// KillswitchFile is the path whose mere presence halts all execution.
-	KillswitchFile string `toml:"killswitch_file"`
+	KillswitchFile string `toml:"killswitch"`
 }
 
 // Config is the root configuration for the daemon.
@@ -78,7 +78,7 @@ func Defaults() *Config {
 		},
 		Storage: Storage{
 			LedgerPath:     filepath.Join(base, "ledger.db"),
-			KillswitchFile: filepath.Join(base, "KILL"),
+			KillswitchFile: filepath.Join(base, "STOP"),
 		},
 	}
 }

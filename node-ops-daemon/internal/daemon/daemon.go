@@ -161,25 +161,37 @@ func (d *Daemon) dispatch(req Request) Response {
 	switch req.Action {
 	case "execute_fee_set":
 		return d.handleFeeSet(reqID, req.Params)
-	case "approve":
-		return d.handleApprove(reqID, req.Params)
-	case "reject":
-		return d.handleReject(reqID, req.Params)
 	case "list_pending":
 		return d.handleListPending(reqID)
 	case "status":
+		d.record(reqID, req.Action, req.Params, "ok", "")
 		return Response{
 			Status:    "ok",
 			RequestID: reqID,
 			Result:    map[string]string{"state": "running"},
 		}
 	default:
+		reason := fmt.Sprintf("unknown action: %q", req.Action)
+		d.record(reqID, req.Action, req.Params, "rejected", reason)
 		return Response{
 			Status:    "error",
 			RequestID: reqID,
-			Reason:    fmt.Sprintf("unknown action: %q", req.Action),
+			Reason:    reason,
 		}
 	}
+}
+
+func (d *Daemon) record(reqID, action string, params json.RawMessage,
+	status, reason string) {
+
+	_ = d.ledger.Record(ledger.Entry{
+		RequestID: reqID,
+		Action:    action,
+		Params:    string(params),
+		Status:    status,
+		Reason:    reason,
+		CreatedAt: time.Now(),
+	})
 }
 
 // feeSetParams are the parameters for the execute_fee_set action.
@@ -193,6 +205,8 @@ type feeSetParams struct {
 func (d *Daemon) handleFeeSet(reqID string, raw json.RawMessage) Response {
 	var p feeSetParams
 	if err := json.Unmarshal(raw, &p); err != nil {
+		d.record(reqID, "execute_fee_set", raw, "rejected",
+			"invalid params: "+err.Error())
 		return Response{Status: "error", RequestID: reqID, Reason: "invalid params: " + err.Error()}
 	}
 
@@ -244,58 +258,12 @@ func (d *Daemon) handleFeeSet(reqID string, raw json.RawMessage) Response {
 	}
 }
 
-type approveParams struct {
-	RequestID string `json:"request_id"`
-}
-
-func (d *Daemon) handleApprove(reqID string, raw json.RawMessage) Response {
-	var p approveParams
-	if err := json.Unmarshal(raw, &p); err != nil {
-		return Response{Status: "error", RequestID: reqID, Reason: "invalid params: " + err.Error()}
-	}
-	item, ok := d.queue.Approve(p.RequestID)
-	if !ok {
-		return Response{Status: "error", RequestID: reqID,
-			Reason: fmt.Sprintf("request_id %q not found or already decided", p.RequestID)}
-	}
-	_ = d.ledger.Record(ledger.Entry{
-		RequestID: reqID, Action: "approve",
-		Params:    fmt.Sprintf(`{"approved_id":%q}`, p.RequestID),
-		Status:    "ok", CreatedAt: time.Now(),
-	})
-	return Response{Status: "ok", RequestID: reqID,
-		Result: map[string]string{"approved": item.RequestID}}
-}
-
-type rejectParams struct {
-	RequestID string `json:"request_id"`
-	Reason    string `json:"reason"`
-}
-
-func (d *Daemon) handleReject(reqID string, raw json.RawMessage) Response {
-	var p rejectParams
-	if err := json.Unmarshal(raw, &p); err != nil {
-		return Response{Status: "error", RequestID: reqID, Reason: "invalid params: " + err.Error()}
-	}
-	item, ok := d.queue.Reject(p.RequestID, p.Reason)
-	if !ok {
-		return Response{Status: "error", RequestID: reqID,
-			Reason: fmt.Sprintf("request_id %q not found or already decided", p.RequestID)}
-	}
-	_ = d.ledger.Record(ledger.Entry{
-		RequestID: reqID, Action: "reject",
-		Params:    fmt.Sprintf(`{"rejected_id":%q}`, p.RequestID),
-		Status:    "ok", Reason: p.Reason, CreatedAt: time.Now(),
-	})
-	return Response{Status: "ok", RequestID: reqID,
-		Result: map[string]string{"rejected": item.RequestID}}
-}
-
 func (d *Daemon) handleListPending(reqID string) Response {
 	items := d.queue.ListPending()
 	if items == nil {
 		items = []queue.Item{}
 	}
+	d.record(reqID, "list_pending", nil, "ok", "")
 	return Response{Status: "ok", RequestID: reqID, Result: items}
 }
 

@@ -244,11 +244,56 @@ func createTestInvoice(amount int64, memo string) *lnrpc.Invoice {
 	}
 }
 
+func TestChannelActionsService_ToolCreation(t *testing.T) {
+	service := NewChannelActionsService(nil)
+
+	t.Run("propose_channel_actions_tool", func(t *testing.T) {
+		tool := service.ProposeChannelActionsTool()
+		assert.Equal(t, "lnc_propose_channel_actions", tool.Name)
+		assert.Contains(t, tool.Description, "Read-only")
+		schema := requireToolSchema(t, tool.InputSchema)
+		assert.Equal(t, "object", schema.Type)
+
+		props := schema.Properties
+		assert.Contains(t, props, "lookback_days")
+		assert.Contains(t, props, "max_close_candidates")
+		assert.Contains(t, props, "max_open_candidates")
+
+		lookbackField, ok := props["lookback_days"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, "integer", lookbackField["type"])
+	})
+}
+
+func TestChannelActionsService_NilClient(t *testing.T) {
+	service := NewChannelActionsService(nil)
+	assert.NotNil(t, service)
+	assert.Nil(t, service.LightningClient)
+}
+
 func TestCreateTestInvoice(t *testing.T) {
 	invoice := createTestInvoice(1000, "test memo")
 	assert.Equal(t, int64(1000000), invoice.ValueMsat)
 	assert.Equal(t, "test memo", invoice.Memo)
 	assert.Equal(t, int64(3600), invoice.Expiry)
+}
+
+// Test HealthService basic functionality.
+func TestHealthService_ToolCreation(t *testing.T) {
+	service := NewHealthService(nil)
+
+	t.Run("node_health_tool", func(t *testing.T) {
+		tool := service.NodeHealthTool()
+		assert.Equal(t, "lnc_node_health", tool.Name)
+		assert.Contains(t, tool.Description, "health")
+		schema := requireToolSchema(t, tool.InputSchema)
+		assert.Equal(t, "object", schema.Type)
+	})
+
+	t.Run("service_management", func(t *testing.T) {
+		assert.NotNil(t, service)
+		assert.Nil(t, service.LightningClient)
+	})
 }
 
 // Benchmark tests for performance.

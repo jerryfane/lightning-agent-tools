@@ -26,4 +26,4 @@ require_approval = false
 ledger = "~/.node-ops/ledger.db"
 
 # Creating this file halts all daemon execution immediately.
-killswitch_file = "~/.node-ops/KILL"
+killswitch = "~/.node-ops/STOP"
