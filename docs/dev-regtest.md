@@ -44,7 +44,7 @@ This starts two containers:
 ## 3. Create a wallet and fund the node
 
 ```bash
-skills/lnd/scripts/create-wallet.sh --container litd
+skills/lnd/scripts/create-wallet.sh --container litd --mode standalone
 
 # mine 101 blocks to a node address (101 = coinbase maturity + 1)
 docker exec litd-bitcoind bitcoin-cli -regtest -rpcuser=devuser -rpcpassword=devpass \
@@ -74,8 +74,8 @@ only an ephemeral in-memory keypair for the session.
 # dev mode (insecure TLS for the local mailbox); writes lightning-mcp-server/.env
 skills/lightning-mcp-server/scripts/configure.sh --dev
 
-# then set the pairing phrase from step 4
-#   LNC_PAIRING_PHRASE="word1 word2 … word10"   in lightning-mcp-server/.env
+# then pass the pairing phrase and password to the `lnc_connect` tool.
+# Do not write the one-time pairing phrase to `.env` or any other file.
 ```
 
 ## 6. Run the read tools end-to-end
@@ -86,7 +86,7 @@ node:
 
 - `lnc_get_info` → node pubkey, synced height, version
 - `lnc_list_channels`, `lnc_pending_channels`
-- `lnc_wallet_balance`, `lnc_channel_balance`
+- `lnc_get_balance` → wallet and channel balances
 - `lnc_describe_graph`, `lnc_list_peers`
 
 All 18 tools are read-only — they query state and never mutate the node.
