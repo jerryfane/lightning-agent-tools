@@ -37,6 +37,23 @@ The daemon binary is `node-ops-daemon/node-ops-daemon`.
 
 ## 2. Start a two-node regtest stack
 
+If a local Bitcoin Core or LND process already owns the default published
+regtest ports, set alternate host ports before starting the stack:
+
+```bash
+export BITCOIND_RPC_PORT=19443
+export BITCOIND_ZMQ_BLOCK_PORT=28342
+export BITCOIND_ZMQ_TX_PORT=28343
+export LITD_HTTPS_PORT=18453
+export LND_GRPC_PORT=11009
+export LND_P2P_PORT=19735
+export LND_REST_PORT=18080
+export BOB_LITD_HTTPS_PORT=18454
+export BOB_LND_GRPC_PORT=11010
+export BOB_LND_P2P_PORT=19736
+export BOB_LND_REST_PORT=18081
+```
+
 Start the primary node plus Bitcoin Core, then enable the second litd node used
 for channel and rebalance testing:
 
@@ -102,14 +119,16 @@ Confirm both nodes see the channels:
 
 ```bash
 docker exec litd lncli --network=regtest listchannels | jq '.channels[] | {
-  chan_id,
+  short_channel_id: (.scid // .chan_id),
+  scid_str: (.scid_str // ""),
   remote_pubkey,
   capacity,
   local_balance,
   remote_balance
 }'
 docker exec litd-bob lncli --network=regtest listchannels | jq '.channels[] | {
-  chan_id,
+  short_channel_id: (.scid // .chan_id),
+  scid_str: (.scid_str // ""),
   remote_pubkey,
   capacity,
   local_balance,
@@ -121,7 +140,7 @@ Export the channel ids used by later steps:
 
 ```bash
 mapfile -t NODE_OPS_CHANNELS < <(
-  docker exec litd lncli --network=regtest listchannels | jq -r '.channels[].chan_id'
+  docker exec litd lncli --network=regtest listchannels | jq -r '.channels[] | (.scid // .chan_id)'
 )
 if [ "${#NODE_OPS_CHANNELS[@]}" -lt 3 ]; then
   echo "expected at least three node-ops channels" >&2
@@ -196,10 +215,13 @@ chmod 600 "$HOME/.node-ops/node-ops.macaroon" "$HOME/.node-ops/tls.cert"
 ```bash
 cp node-ops-daemon/config.example.toml "$HOME/.node-ops/config.toml"
 python3 - <<'PY'
+import os
 from pathlib import Path
 
 path = Path.home() / ".node-ops" / "config.toml"
 body = path.read_text()
+body = body.replace('lnd_rpc = "127.0.0.1:10009"',
+                    f'lnd_rpc = "127.0.0.1:{os.environ.get("LND_GRPC_PORT", "10009")}"')
 body = body.replace('macaroon = "~/.node-ops/node-ops.macaroon"',
                     f'macaroon = "{Path.home()}/.node-ops/node-ops.macaroon"')
 body = body.replace('tls_cert = "~/.lnd/tls.cert"',

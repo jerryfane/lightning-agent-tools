@@ -463,6 +463,6 @@ Regtest mode adds:
 
 | Port | Service | Daemon |
 |------|---------|--------|
-| 18443 | Bitcoin RPC | bitcoind |
-| 28332 | ZMQ block notifications | bitcoind |
-| 28333 | ZMQ tx notifications | bitcoind |
+| 18443 | Bitcoin RPC | bitcoind, override with `BITCOIND_RPC_PORT` |
+| 28332 | ZMQ block notifications | bitcoind, override with `BITCOIND_ZMQ_BLOCK_PORT` |
+| 28333 | ZMQ tx notifications | bitcoind, override with `BITCOIND_ZMQ_TX_PORT` |
