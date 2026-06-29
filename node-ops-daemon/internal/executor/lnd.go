@@ -5,20 +5,27 @@ package executor
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"github.com/lightningnetwork/lnd/macaroons"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"gopkg.in/macaroon.v2"
 )
+
+const keysendPreimageRecordType uint64 = 5482373484
 
 // LNDConfig holds the daemon-owned LND connection settings.
 type LNDConfig struct {
@@ -35,6 +42,7 @@ type LNDConfig struct {
 type LNDExecutor struct {
 	conn            *grpc.ClientConn
 	client          lnrpc.LightningClient
+	router          routerrpc.RouterClient
 	requiredNetwork string
 	requestTimeout  time.Duration
 }
@@ -87,6 +95,7 @@ func NewLNDExecutor(ctx context.Context, cfg LNDConfig) (*LNDExecutor, error) {
 	return &LNDExecutor{
 		conn:            conn,
 		client:          lnrpc.NewLightningClient(conn),
+		router:          routerrpc.NewRouterClient(conn),
 		requiredNetwork: strings.TrimSpace(cfg.RequiredNetwork),
 		requestTimeout:  cfg.RequestTimeout,
 	}, nil
@@ -186,6 +195,106 @@ func (e *LNDExecutor) ExecuteFeeSet(ctx context.Context, req FeeSetRequest) erro
 	return nil
 }
 
+// ExecuteRebalance executes a bounded circular rebalance using QueryRoutes plus
+// SendToRouteV2. The daemon remains responsible for approval, budgets, and
+// audit logging before this method is called.
+func (e *LNDExecutor) ExecuteRebalance(ctx context.Context,
+	req RebalanceRequest) (RebalanceResult, error) {
+
+	ctx, cancel := e.withRequestTimeout(ctx)
+	defer cancel()
+
+	if req.OutgoingChanID == 0 {
+		return RebalanceResult{}, fmt.Errorf("outgoing_chan_id must be non-zero")
+	}
+	if req.IncomingChanID == 0 {
+		return RebalanceResult{}, fmt.Errorf("incoming_chan_id must be non-zero")
+	}
+	if req.OutgoingChanID == req.IncomingChanID {
+		return RebalanceResult{}, fmt.Errorf("incoming_chan_id must differ from outgoing_chan_id")
+	}
+	if req.AmountSat <= 0 {
+		return RebalanceResult{}, fmt.Errorf("amount_sat must be positive")
+	}
+	if req.MaxFeePpm < 0 {
+		return RebalanceResult{}, fmt.Errorf("max_fee_ppm must be non-negative")
+	}
+
+	info, err := e.requireNetworkInfo(ctx)
+	if err != nil {
+		return RebalanceResult{}, err
+	}
+	incomingPeer, err := e.remotePubkeyForChannel(ctx, req.IncomingChanID)
+	if err != nil {
+		return RebalanceResult{}, err
+	}
+	incomingPeerBytes, err := decodePubKey(incomingPeer)
+	if err != nil {
+		return RebalanceResult{}, fmt.Errorf("decode incoming channel peer pubkey: %w", err)
+	}
+	feeLimitMsat, err := rebalanceFeeLimitMsat(req.AmountSat, req.MaxFeePpm)
+	if err != nil {
+		return RebalanceResult{}, err
+	}
+	preimage, paymentHash, err := newKeysendPreimage()
+	if err != nil {
+		return RebalanceResult{}, err
+	}
+
+	routes, err := e.client.QueryRoutes(ctx, &lnrpc.QueryRoutesRequest{
+		PubKey:            info.GetIdentityPubkey(),
+		Amt:               req.AmountSat,
+		FeeLimit:          fixedMsatFeeLimit(feeLimitMsat),
+		UseMissionControl: true,
+		OutgoingChanId:    req.OutgoingChanID,
+		LastHopPubkey:     incomingPeerBytes,
+		DestCustomRecords: map[uint64][]byte{
+			keysendPreimageRecordType: preimage[:],
+		},
+	})
+	if err != nil {
+		return RebalanceResult{}, fmt.Errorf("query rebalance route: %w", err)
+	}
+	if len(routes.GetRoutes()) == 0 {
+		return RebalanceResult{}, fmt.Errorf("query rebalance route: no route found")
+	}
+	route := routes.GetRoutes()[0]
+	if err := verifyRebalanceRoute(route, req); err != nil {
+		return RebalanceResult{}, err
+	}
+	if err := verifyRouteFee(route, feeLimitMsat); err != nil {
+		return RebalanceResult{}, err
+	}
+
+	attempt, err := e.router.SendToRouteV2(ctx, &routerrpc.SendToRouteRequest{
+		PaymentHash: paymentHash[:],
+		Route:       route,
+	})
+	if err != nil {
+		return RebalanceResult{}, fmt.Errorf("send rebalance route: %w", err)
+	}
+	if attempt.GetStatus() != lnrpc.HTLCAttempt_SUCCEEDED {
+		return RebalanceResult{}, fmt.Errorf("send rebalance route failed: %s",
+			formatHTLCFailure(attempt))
+	}
+	resultRoute := attempt.GetRoute()
+	if resultRoute == nil {
+		resultRoute = route
+	}
+	feeSat := msatToSatCeil(resultRoute.GetTotalFeesMsat())
+	feePpm, err := feePPMFromMsat(req.AmountSat, resultRoute.GetTotalFeesMsat())
+	if err != nil {
+		return RebalanceResult{}, err
+	}
+	return RebalanceResult{
+		PaymentHash: hex.EncodeToString(paymentHash[:]),
+		AmountSat:   req.AmountSat,
+		FeeSat:      feeSat,
+		FeePpm:      feePpm,
+		Status:      "succeeded",
+	}, nil
+}
+
 func (e *LNDExecutor) NodeHealth(ctx context.Context) (NodeHealthSnapshot, error) {
 	return NodeHealthSnapshot{}, ErrNotImplemented
 }
@@ -200,16 +309,21 @@ func (e *LNDExecutor) withRequestTimeout(ctx context.Context) (context.Context,
 }
 
 func (e *LNDExecutor) requireNetwork(ctx context.Context) error {
+	_, err := e.requireNetworkInfo(ctx)
+	return err
+}
+
+func (e *LNDExecutor) requireNetworkInfo(ctx context.Context) (*lnrpc.GetInfoResponse, error) {
 	info, err := e.client.GetInfo(ctx, &lnrpc.GetInfoRequest{})
 	if err != nil {
-		return fmt.Errorf("get lnd info: %w", err)
+		return nil, fmt.Errorf("get lnd info: %w", err)
 	}
 	for _, chain := range info.GetChains() {
 		if chain.GetNetwork() == e.requiredNetwork {
-			return nil
+			return info, nil
 		}
 	}
-	return fmt.Errorf("lnd network is not %s", e.requiredNetwork)
+	return nil, fmt.Errorf("lnd network is not %s", e.requiredNetwork)
 }
 
 func (e *LNDExecutor) currentRoutingPolicy(ctx context.Context,
@@ -248,6 +362,33 @@ func (e *LNDExecutor) currentRoutingPolicy(ctx context.Context,
 func (e *LNDExecutor) channelPoint(ctx context.Context,
 	chanID uint64) (*lnrpc.ChannelPoint, error) {
 
+	ch, err := e.localChannel(ctx, chanID)
+	if err != nil {
+		return nil, err
+	}
+	cp, err := parseChannelPoint(ch.GetChannelPoint())
+	if err != nil {
+		return nil, err
+	}
+	return cp, nil
+}
+
+func (e *LNDExecutor) remotePubkeyForChannel(ctx context.Context,
+	chanID uint64) (string, error) {
+
+	ch, err := e.localChannel(ctx, chanID)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(ch.GetRemotePubkey()) == "" {
+		return "", fmt.Errorf("channel %d remote pubkey missing", chanID)
+	}
+	return ch.GetRemotePubkey(), nil
+}
+
+func (e *LNDExecutor) localChannel(ctx context.Context,
+	chanID uint64) (*lnrpc.Channel, error) {
+
 	resp, err := e.client.ListChannels(ctx, &lnrpc.ListChannelsRequest{})
 	if err != nil {
 		return nil, fmt.Errorf("list channels: %w", err)
@@ -256,11 +397,7 @@ func (e *LNDExecutor) channelPoint(ctx context.Context,
 		if ch.GetChanId() != chanID {
 			continue
 		}
-		cp, err := parseChannelPoint(ch.GetChannelPoint())
-		if err != nil {
-			return nil, err
-		}
-		return cp, nil
+		return ch, nil
 	}
 	return nil, fmt.Errorf("channel %d not found in local channels", chanID)
 }
@@ -295,4 +432,106 @@ func formatFailedUpdates(updates []*lnrpc.FailedUpdate) string {
 		return errors.New("unknown failure").Error()
 	}
 	return strings.Join(parts, "; ")
+}
+
+func decodePubKey(value string) ([]byte, error) {
+	value = strings.TrimSpace(value)
+	decoded, err := hex.DecodeString(value)
+	if err != nil {
+		return nil, err
+	}
+	if len(decoded) != 33 {
+		return nil, fmt.Errorf("pubkey has %d bytes, want 33", len(decoded))
+	}
+	return decoded, nil
+}
+
+func newKeysendPreimage() ([32]byte, [32]byte, error) {
+	var preimage [32]byte
+	if _, err := rand.Read(preimage[:]); err != nil {
+		return [32]byte{}, [32]byte{}, fmt.Errorf("generate keysend preimage: %w", err)
+	}
+	return preimage, sha256.Sum256(preimage[:]), nil
+}
+
+func fixedMsatFeeLimit(feeMsat int64) *lnrpc.FeeLimit {
+	return &lnrpc.FeeLimit{
+		Limit: &lnrpc.FeeLimit_FixedMsat{FixedMsat: feeMsat},
+	}
+}
+
+func rebalanceFeeLimitMsat(amountSat, maxFeePpm int64) (int64, error) {
+	if amountSat <= 0 {
+		return 0, fmt.Errorf("amount_sat must be positive")
+	}
+	if maxFeePpm < 0 {
+		return 0, fmt.Errorf("max_fee_ppm must be non-negative")
+	}
+	n := new(big.Int).Mul(big.NewInt(amountSat), big.NewInt(maxFeePpm))
+	n.Add(n, big.NewInt(999))
+	n.Div(n, big.NewInt(1000))
+	if !n.IsInt64() {
+		return 0, fmt.Errorf("fee limit overflows int64")
+	}
+	return n.Int64(), nil
+}
+
+func verifyRebalanceRoute(route *lnrpc.Route, req RebalanceRequest) error {
+	hops := route.GetHops()
+	if len(hops) == 0 {
+		return fmt.Errorf("query rebalance route: empty route")
+	}
+	if hops[0].GetChanId() != req.OutgoingChanID {
+		return fmt.Errorf("query rebalance route: first hop channel %d does not match outgoing_chan_id %d",
+			hops[0].GetChanId(), req.OutgoingChanID)
+	}
+	last := hops[len(hops)-1]
+	if last.GetChanId() != req.IncomingChanID {
+		return fmt.Errorf("query rebalance route: last hop channel %d does not match incoming_chan_id %d",
+			last.GetChanId(), req.IncomingChanID)
+	}
+	return nil
+}
+
+func verifyRouteFee(route *lnrpc.Route, feeLimitMsat int64) error {
+	feeMsat := route.GetTotalFeesMsat()
+	if feeMsat > feeLimitMsat {
+		return fmt.Errorf("query rebalance route: fee %d msat exceeds max fee %d msat",
+			feeMsat, feeLimitMsat)
+	}
+	return nil
+}
+
+func msatToSatCeil(msat int64) int64 {
+	if msat <= 0 {
+		return 0
+	}
+	return (msat + 999) / 1000
+}
+
+func feePPMFromMsat(amountSat, feeMsat int64) (int64, error) {
+	if amountSat <= 0 {
+		return 0, fmt.Errorf("amount_sat must be positive")
+	}
+	if feeMsat <= 0 {
+		return 0, nil
+	}
+	n := new(big.Int).Mul(big.NewInt(feeMsat), big.NewInt(1000))
+	n.Add(n, big.NewInt(amountSat-1))
+	n.Div(n, big.NewInt(amountSat))
+	if !n.IsInt64() {
+		return 0, fmt.Errorf("fee ppm overflows int64")
+	}
+	return n.Int64(), nil
+}
+
+func formatHTLCFailure(attempt *lnrpc.HTLCAttempt) string {
+	if attempt == nil {
+		return "missing attempt response"
+	}
+	status := attempt.GetStatus().String()
+	if failure := attempt.GetFailure(); failure != nil {
+		return status + ": " + failure.String()
+	}
+	return status
 }

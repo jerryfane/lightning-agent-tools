@@ -36,12 +36,12 @@ type Limits struct {
 
 // Approval controls pending-queue policy for money-affecting actions.
 type Approval struct {
-	// AutoExecuteBelowPpmDelta is reserved for future action types. Fee-set
-	// execution always requires operator approval.
+	// AutoExecuteBelowPpmDelta is reserved for future action types. Fee-set and
+	// rebalance execution always require operator approval.
 	AutoExecuteBelowPpmDelta int64 `toml:"auto_execute_below_ppm_delta"`
 
 	// RequireApproval forces supported actions into the pending queue regardless
-	// of size. Fee-set execution is always queued.
+	// of size. Fee-set and rebalance execution are always queued.
 	RequireApproval bool `toml:"require_approval"`
 }
 

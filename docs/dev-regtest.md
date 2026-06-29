@@ -89,11 +89,11 @@ node:
 - `lnc_get_balance` → wallet and channel balances
 - `lnc_describe_graph`, `lnc_list_peers`
 
-The LNC-backed tools are read-only. The `lnc_execute_fee_set` tool is the first
-daemon-gated write path: it submits a request to `node-ops-daemon`, which must
-be configured for regtest, hold the scoped macaroon, enforce fee caps, daily
-fee budget, and cooldowns, require operator-token approval, and write audit
-entries.
+The LNC-backed tools are read-only. The `lnc_execute_fee_set` and
+`lnc_execute_rebalance` tools are daemon-gated write paths: they submit requests
+to `node-ops-daemon`, which must be configured for regtest, hold the scoped
+macaroon, enforce fee caps, daily budgets, and cooldowns, require
+operator-token approval, and write audit entries.
 
 ## Teardown
 

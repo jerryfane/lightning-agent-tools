@@ -10,12 +10,12 @@ assistant never needs direct network access to the node, never handles TLS
 certificates, and never stores macaroons on disk. A 10-word pairing phrase is
 all it takes to establish an encrypted tunnel.
 
-The server exposes 23 tools. The LNC tools are read-only and let an assistant
+The server exposes 24 tools. The LNC tools are read-only and let an assistant
 query node status, inspect channels, decode invoices, look up payments, and
-explore the network graph. The only write path is `lnc_execute_fee_set`, which
-submits a bounded request to `node-ops-daemon`; the MCP server never receives
-LND write credentials and the daemon enforces caps, cooldowns, approvals, the
-kill-switch, and audit logging before any node write.
+explore the network graph. The only write paths are `lnc_execute_fee_set` and
+`lnc_execute_rebalance`, which submit bounded requests to `node-ops-daemon`; the
+MCP server never receives LND write credentials and the daemon enforces caps,
+cooldowns, approvals, the kill-switch, and audit logging before any node write.
 
 ## How LNC Works
 
@@ -180,6 +180,7 @@ The server organizes its tools into these categories:
 |------|-------------|
 | `lnc_query_node_ops_audit` | Query the local node-ops audit ledger |
 | `lnc_execute_fee_set` | Submit a gated fee policy update to `node-ops-daemon` |
+| `lnc_execute_rebalance` | Submit a gated circular rebalance to `node-ops-daemon` |
 
 ## MCP-LNC vs Direct gRPC
 
@@ -197,11 +198,11 @@ different purposes:
 
 **Use MCP-LNC when** the agent needs to observe node state: checking balances,
 listing channels, monitoring payments, inspecting the network graph. For the
-supported fee-set write, use the node-ops daemon path so credentials, approval,
-limits, and audit stay outside the model-callable LNC session.
-Fee-set requests are submitted through the MCP tool but execute only after an
-operator approves on the separate operator socket with the private operator
-token.
+supported fee-set and rebalance writes, use the node-ops daemon path so
+credentials, approval, limits, and audit stay outside the model-callable LNC
+session. Fee-set and rebalance requests are submitted through MCP tools but
+execute only after an operator approves on the separate operator socket with the
+private operator token.
 
 **Use direct gRPC when** the agent needs to perform actions: sending payments,
 opening channels, creating invoices. Direct gRPC requires the `lnd` skill and
