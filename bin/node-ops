@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""Ergonomic CLI for node-ops-daemon workflows."""
+
+from __future__ import annotations
+
+import os
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "skills" / "node-ops" / "scripts"
+OBSERVE = SCRIPTS / "observe.py"
+PROPOSE = SCRIPTS / "propose.py"
+EXECUTE = SCRIPTS / "execute.py"
+MACAROON_BAKE = ROOT / "skills" / "macaroon-bakery" / "scripts" / "bake.sh"
+DAEMON_BIN = ROOT / "node-ops-daemon" / "node-ops-daemon"
+CONFIG_EXAMPLE = ROOT / "node-ops-daemon" / "config.example.toml"
+
+COMMON = {
+    "--socket",
+    "--timeout",
+}
+OPERATOR_COMMON = {
+    "--operator-socket",
+    "--operator-token-file",
+}
+
+
+USAGE = """\
+Usage:
+  node-ops init [--container litd] [--network regtest] [--force]
+  node-ops daemon [--config PATH]
+
+  node-ops status [--socket PATH] [--timeout SECONDS]
+  node-ops pending [--socket PATH] [--timeout SECONDS]
+  node-ops audit [audit options]
+  node-ops alerts [-f|--follow] [--lines N] [--path PATH]
+  node-ops watch [--interval SECONDS] status|pending|audit [options]
+
+  node-ops propose fee-set --chan-id ID --base-msat MSAT --fee-ppm PPM
+  node-ops propose rebalance --outgoing-chan-id ID --incoming-chan-id ID --amount-sat SAT --max-fee-ppm PPM
+
+  node-ops submit fee-set --chan-id ID --base-msat MSAT --fee-ppm PPM
+  node-ops submit rebalance --outgoing-chan-id ID --incoming-chan-id ID --amount-sat SAT --max-fee-ppm PPM
+
+  node-ops approve fee-set --request-id ID
+  node-ops deny fee-set --request-id ID [--reason TEXT]
+  node-ops approve rebalance --request-id ID
+  node-ops deny rebalance --request-id ID [--reason TEXT]
+
+Aliases:
+  execute = submit
+  approve-fee-set, deny-fee-set, approve-rebalance, deny-rebalance are accepted.
+"""
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in {"-h", "--help", "help"}:
+        print(USAGE)
+        return 0
+
+    cmd = argv[0]
+    rest = argv[1:]
+
+    if cmd == "init":
+        return init(rest)
+    if cmd == "daemon":
+        return daemon(rest)
+    if cmd == "status":
+        return run_observe("status", rest)
+    if cmd == "pending":
+        return run_observe("pending", rest)
+    if cmd == "audit":
+        return run_observe("audit", rest)
+    if cmd == "alerts":
+        return alerts(rest)
+    if cmd == "watch":
+        return watch(rest)
+    if cmd == "propose":
+        return propose(rest)
+    if cmd in {"submit", "execute"}:
+        return submit(rest)
+    if cmd in {"approve", "deny"}:
+        return decision(cmd, rest)
+    if cmd in {
+        "approve-fee-set",
+        "deny-fee-set",
+        "approve-rebalance",
+        "deny-rebalance",
+    }:
+        return run_script(EXECUTE, rest, cmd, allowed_common=COMMON | OPERATOR_COMMON)
+
+    print(f"node-ops: unknown command {cmd!r}\n", file=sys.stderr)
+    print(USAGE, file=sys.stderr)
+    return 2
+
+
+def init(args: list[str]) -> int:
+    home = Path("~/.node-ops").expanduser()
+    container = "litd"
+    network = "regtest"
+    lnd_rpc = f"127.0.0.1:{os.environ.get('LND_GRPC_PORT', '10009')}"
+    poll_interval = "2s"
+    alert_cooldown = "1m"
+    force = False
+    monitor = True
+    bake = True
+    copy_tls = True
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--container":
+            container = required_value(args, i, arg)
+            i += 1
+        elif arg == "--network":
+            network = required_value(args, i, arg)
+            i += 1
+        elif arg == "--lnd-rpc":
+            lnd_rpc = required_value(args, i, arg)
+            i += 1
+        elif arg == "--poll-interval":
+            poll_interval = required_value(args, i, arg)
+            i += 1
+        elif arg == "--alert-cooldown":
+            alert_cooldown = required_value(args, i, arg)
+            i += 1
+        elif arg == "--force":
+            force = True
+        elif arg == "--no-monitor":
+            monitor = False
+        elif arg == "--no-bake":
+            bake = False
+        elif arg == "--no-tls-copy":
+            copy_tls = False
+        elif arg in {"-h", "--help"}:
+            print(
+                "Usage: node-ops init [--container litd] [--network regtest] "
+                "[--lnd-rpc HOST:PORT] [--force] [--no-monitor] "
+                "[--no-bake] [--no-tls-copy]"
+            )
+            return 0
+        else:
+            print(f"node-ops init: unknown option {arg!r}", file=sys.stderr)
+            return 2
+        i += 1
+
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    home.chmod(0o700)
+
+    macaroon = home / "node-ops.macaroon"
+    tls_cert = home / "tls.cert"
+    token = home / "operator.token"
+    config = home / "config.toml"
+
+    if bake and (force or not macaroon.exists()):
+        if not MACAROON_BAKE.exists():
+            print(f"node-ops init: missing {MACAROON_BAKE}", file=sys.stderr)
+            return 1
+        code = call(
+            [
+                str(MACAROON_BAKE),
+                "--container",
+                container,
+                "--network",
+                network,
+                "--role",
+                "node-ops",
+                "--save-to",
+                str(macaroon),
+            ]
+        )
+        if code != 0:
+            return code
+
+    if copy_tls and (force or not tls_cert.exists()):
+        code = call(["docker", "cp", f"{container}:/root/.lnd/tls.cert", str(tls_cert)])
+        if code != 0:
+            return code
+
+    write_config = force or not config.exists()
+    if write_config and not CONFIG_EXAMPLE.exists():
+        print(f"node-ops init: missing {CONFIG_EXAMPLE}", file=sys.stderr)
+        return 1
+    if write_config:
+        shutil.copyfile(CONFIG_EXAMPLE, config)
+        update_config(
+            config,
+            {
+                'ledger = "~/.node-ops/ledger.db"': f'ledger = "{home / "ledger.db"}"',
+                'limits_state = "~/.node-ops/limits-state.json"': (
+                    f'limits_state = "{home / "limits-state.json"}"'
+                ),
+                'killswitch = "~/.node-ops/STOP"': f'killswitch = "{home / "STOP"}"',
+                'lnd_rpc = "127.0.0.1:10009"': f'lnd_rpc = "{lnd_rpc}"',
+                'required_network = "regtest"': f'required_network = "{network}"',
+                'macaroon = "~/.node-ops/node-ops.macaroon"': f'macaroon = "{macaroon}"',
+                'tls_cert = "~/.lnd/tls.cert"': f'tls_cert = "{tls_cert}"',
+                'approval_socket = "~/.node-ops/operator.sock"': (
+                    f'approval_socket = "{home / "operator.sock"}"'
+                ),
+                'approval_token_file = "~/.node-ops/operator.token"': (
+                    f'approval_token_file = "{token}"'
+                ),
+                'enabled = false': f'enabled = {str(monitor).lower()}',
+                'poll_interval = "30s"': f'poll_interval = "{poll_interval}"',
+                'alert_cooldown = "10m"': f'alert_cooldown = "{alert_cooldown}"',
+                'alert_path = "~/.node-ops/alerts.jsonl"': (
+                    f'alert_path = "{home / "alerts.jsonl"}"'
+                ),
+            },
+        )
+
+    if force or not token.exists():
+        token.write_text(secrets.token_urlsafe(32) + "\n", encoding="utf-8")
+    chmod_if_exists(macaroon, 0o600)
+    chmod_if_exists(tls_cert, 0o600)
+    chmod_if_exists(token, 0o600)
+
+    print(f"node-ops initialized {home}")
+    print(f"config: {config}")
+    print("")
+    print("Next:")
+    print("  node-ops daemon")
+    print("  node-ops status")
+    return 0
+
+
+def daemon(args: list[str]) -> int:
+    config = Path("~/.node-ops/config.toml").expanduser()
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--config":
+            config = Path(required_value(args, i, arg)).expanduser()
+            i += 1
+        elif arg in {"-h", "--help"}:
+            print("Usage: node-ops daemon [--config PATH]")
+            return 0
+        else:
+            print(f"node-ops daemon: unknown option {arg!r}", file=sys.stderr)
+            return 2
+        i += 1
+
+    if not DAEMON_BIN.exists():
+        print(
+            f"node-ops daemon: missing {DAEMON_BIN}. "
+            "Build it with: cd node-ops-daemon && make build && cd ..",
+            file=sys.stderr,
+        )
+        return 1
+    if not config.exists():
+        print(
+            f"node-ops daemon: missing {config}. "
+            "Run: node-ops init --container litd",
+            file=sys.stderr,
+        )
+        return 1
+    return call([str(DAEMON_BIN), str(config)])
+
+
+def required_value(args: list[str], index: int, option: str) -> str:
+    if index + 1 >= len(args):
+        print(f"node-ops: {option} requires a value", file=sys.stderr)
+        raise SystemExit(2)
+    return args[index + 1]
+
+
+def update_config(path: Path, replacements: dict[str, str]) -> None:
+    body = path.read_text(encoding="utf-8")
+    for old, new in replacements.items():
+        body = body.replace(old, new)
+    path.write_text(body, encoding="utf-8")
+
+
+def chmod_if_exists(path: Path, mode: int) -> None:
+    if path.exists():
+        path.chmod(mode)
+
+
+def run_observe(command: str, args: list[str]) -> int:
+    common, rest = split_common(args, COMMON)
+    return call([sys.executable, str(OBSERVE), *common, command, *rest])
+
+
+def propose(args: list[str]) -> int:
+    if not args:
+        print("node-ops propose: expected fee-set or rebalance", file=sys.stderr)
+        return 2
+    action = args[0]
+    if action not in {"fee-set", "rebalance"}:
+        print(f"node-ops propose: unknown action {action!r}", file=sys.stderr)
+        return 2
+    return run_script(PROPOSE, args[1:], action, allowed_common=COMMON)
+
+
+def submit(args: list[str]) -> int:
+    if not args:
+        print("node-ops submit: expected fee-set or rebalance", file=sys.stderr)
+        return 2
+    action = args[0]
+    if action not in {"fee-set", "rebalance"}:
+        print(f"node-ops submit: unknown action {action!r}", file=sys.stderr)
+        return 2
+    return run_script(EXECUTE, args[1:], action, allowed_common=COMMON | OPERATOR_COMMON)
+
+
+def decision(kind: str, args: list[str]) -> int:
+    if not args:
+        print(f"node-ops {kind}: expected fee-set or rebalance", file=sys.stderr)
+        return 2
+    target = args[0]
+    if target not in {"fee-set", "rebalance"}:
+        print(f"node-ops {kind}: unknown target {target!r}", file=sys.stderr)
+        return 2
+    return run_script(
+        EXECUTE,
+        args[1:],
+        f"{kind}-{target}",
+        allowed_common=COMMON | OPERATOR_COMMON,
+    )
+
+
+def run_script(
+    script: Path,
+    args: list[str],
+    command: str,
+    *,
+    allowed_common: set[str],
+) -> int:
+    common, rest = split_common(args, allowed_common)
+    return call([sys.executable, str(script), *common, command, *rest])
+
+
+def split_common(args: list[str], allowed: set[str]) -> tuple[list[str], list[str]]:
+    common: list[str] = []
+    rest: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        key = arg.split("=", 1)[0]
+        if key in allowed:
+            common.append(arg)
+            if "=" not in arg:
+                if i + 1 >= len(args):
+                    print(f"node-ops: {arg} requires a value", file=sys.stderr)
+                    raise SystemExit(2)
+                common.append(args[i + 1])
+                i += 1
+        else:
+            rest.append(arg)
+        i += 1
+    return common, rest
+
+
+def alerts(args: list[str]) -> int:
+    path = Path(os.environ.get("NODE_OPS_ALERT_FILE", "~/.node-ops/alerts.jsonl")).expanduser()
+    follow = False
+    lines = "20"
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in {"-f", "--follow"}:
+            follow = True
+        elif arg == "--path":
+            if i + 1 >= len(args):
+                print("node-ops alerts: --path requires a value", file=sys.stderr)
+                return 2
+            path = Path(args[i + 1]).expanduser()
+            i += 1
+        elif arg == "--lines":
+            if i + 1 >= len(args):
+                print("node-ops alerts: --lines requires a value", file=sys.stderr)
+                return 2
+            lines = args[i + 1]
+            i += 1
+        else:
+            print(f"node-ops alerts: unknown option {arg!r}", file=sys.stderr)
+            return 2
+        i += 1
+
+    if not path.exists():
+        print(f"node-ops alerts: {path} does not exist yet", file=sys.stderr)
+        return 1
+
+    tail_args = ["tail", "-n", lines]
+    if follow:
+        tail_args.append("-f")
+    tail_args.append(str(path))
+    return call(tail_args)
+
+
+def watch(args: list[str]) -> int:
+    interval = 2.0
+    if args[:1] == ["--interval"]:
+        if len(args) < 3:
+            print("node-ops watch: --interval requires a value and command", file=sys.stderr)
+            return 2
+        try:
+            interval = float(args[1])
+        except ValueError:
+            print("node-ops watch: --interval must be a number", file=sys.stderr)
+            return 2
+        if interval <= 0:
+            print("node-ops watch: --interval must be positive", file=sys.stderr)
+            return 2
+        args = args[2:]
+    if not args:
+        print("node-ops watch: expected status, pending, or audit", file=sys.stderr)
+        return 2
+    if args[0] not in {"status", "pending", "audit"}:
+        print("node-ops watch: expected status, pending, or audit", file=sys.stderr)
+        return 2
+
+    try:
+        while True:
+            print(time.strftime("== %Y-%m-%d %H:%M:%S =="))
+            code = main(args)
+            if code not in (0, 1):
+                return code
+            sys.stdout.flush()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        sys.stdout.write("\n")
+        return 130
+
+
+def call(cmd: list[str]) -> int:
+    env = os.environ.copy()
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    try:
+        return subprocess.call(cmd, env=env)
+    except FileNotFoundError as exc:
+        print(f"node-ops: command not found: {exc.filename}", file=sys.stderr)
+        return 127
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

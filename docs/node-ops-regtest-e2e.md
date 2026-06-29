@@ -1,7 +1,7 @@
 # Node-Ops Regtest End-to-End Quickstart
 
 This runbook proves the bounded node-ops path on a disposable regtest stack:
-setup -> bake the scoped `node-ops` macaroon -> run `node-ops-daemon` ->
+setup -> bake the scoped `node-ops` macaroon -> run `node-ops daemon` ->
 propose -> submit gated fee-set and rebalance requests -> approve from the
 operator boundary -> query the audit ledger.
 
@@ -15,12 +15,14 @@ operator boundary -> query the audit ledger.
 - Docker with Compose.
 - `jq`.
 - Bash in a source checkout of this repository.
+- The checkout's `bin/` directory on `PATH` for the `node-ops` CLI wrapper.
 
 This is a source-checkout runbook. The published npm package includes this
 document for reference, but it does not ship the `node-ops-daemon` source tree;
-clone the repository before running the daemon build and config commands below.
+clone the repository before running the daemon build and operator commands
+below.
 
-Use one terminal for the regtest stack, one for `node-ops-daemon`, and one for
+Use one terminal for the regtest stack, one for the daemon process, and one for
 the operator/client commands below.
 
 ## 1. Build the local binaries
@@ -31,6 +33,8 @@ skills/lightning-mcp-server/scripts/install.sh
 cd node-ops-daemon
 make build
 cd ..
+
+export PATH="$PWD/bin:$PATH"
 ```
 
 The daemon binary is `node-ops-daemon/node-ops-daemon`.
@@ -174,25 +178,28 @@ Copy the printed `pairing_secret_mnemonic` and password from the command output,
 then call the `lnc_connect` MCP tool in your agent session with those values.
 Do not write the one-time pairing phrase to `.env` or another file.
 
-The shell-only daemon client commands below still work without LNC, but the MCP
-proposal calls in the fee-set and rebalance sections will fail until
+The local `node-ops` daemon client commands below still work without LNC, but
+the MCP proposal calls in the fee-set and rebalance sections will fail until
 `lnc_connect` succeeds.
 
-## 4. Bake the scoped node-ops macaroon
+## 4. Initialize node-ops credentials and config
 
-The daemon receives the node write credential. The MCP server and skill scripts
-do not.
+The daemon receives the node write credential. The MCP server and agent-facing
+tools do not. `node-ops init` creates `~/.node-ops`, bakes the scoped macaroon,
+copies the regtest TLS certificate, writes `config.toml`, creates the
+operator-only token, and enables file alerts.
 
 ```bash
-mkdir -p "$HOME/.node-ops"
-chmod 700 "$HOME/.node-ops"
-
-skills/macaroon-bakery/scripts/bake.sh \
+node-ops init \
   --container litd \
   --network regtest \
-  --role node-ops \
-  --save-to "$HOME/.node-ops/node-ops.macaroon"
+  --lnd-rpc "127.0.0.1:${LND_GRPC_PORT:-10009}" \
+  --force
+```
 
+Inspect the daemon-owned macaroon:
+
+```bash
 skills/macaroon-bakery/scripts/bake.sh \
   --container litd \
   --network regtest \
@@ -204,67 +211,28 @@ and read RPCs needed to bound and monitor the action, including
 `PendingChannels` and `ListPeers`. It should not include open-channel,
 close-channel, or high-level payment RPCs.
 
-Copy the regtest TLS certificate from the container:
-
-```bash
-docker cp litd:/root/.lnd/tls.cert "$HOME/.node-ops/tls.cert"
-chmod 600 "$HOME/.node-ops/node-ops.macaroon" "$HOME/.node-ops/tls.cert"
-```
-
-## 5. Configure the daemon and operator token
-
-```bash
-cp node-ops-daemon/config.example.toml "$HOME/.node-ops/config.toml"
-python3 - <<'PY'
-import os
-from pathlib import Path
-
-path = Path.home() / ".node-ops" / "config.toml"
-body = path.read_text()
-body = body.replace('lnd_rpc = "127.0.0.1:10009"',
-                    f'lnd_rpc = "127.0.0.1:{os.environ.get("LND_GRPC_PORT", "10009")}"')
-body = body.replace('macaroon = "~/.node-ops/node-ops.macaroon"',
-                    f'macaroon = "{Path.home()}/.node-ops/node-ops.macaroon"')
-body = body.replace('tls_cert = "~/.lnd/tls.cert"',
-                    f'tls_cert = "{Path.home()}/.node-ops/tls.cert"')
-body = body.replace('approval_token_file = "~/.node-ops/operator.token"',
-                    f'approval_token_file = "{Path.home()}/.node-ops/operator.token"')
-body = body.replace('enabled = false', 'enabled = true')
-body = body.replace('poll_interval = "30s"', 'poll_interval = "2s"')
-body = body.replace('alert_cooldown = "10m"', 'alert_cooldown = "1m"')
-body = body.replace('alert_path = "~/.node-ops/alerts.jsonl"',
-                    f'alert_path = "{Path.home()}/.node-ops/alerts.jsonl"')
-body = body.replace('required_network = "regtest"', 'required_network = "regtest"')
-path.write_text(body)
-PY
-
-python3 - <<'PY'
-import secrets
-from pathlib import Path
-
-path = Path.home() / ".node-ops" / "operator.token"
-path.write_text(secrets.token_urlsafe(32) + "\n")
-path.chmod(0o600)
-PY
-```
-
 Keep `~/.node-ops/operator.token` outside the MCP host process. It is the
-operator-only approval credential.
+operator-only approval credential. The daemon listens on
+`~/.node-ops/daemon.sock`; approval and denial commands use
+`~/.node-ops/operator.sock`.
 
-## 6. Run the daemon
+## 5. Run the daemon
 
 In a separate terminal:
 
 ```bash
-node-ops-daemon/node-ops-daemon "$HOME/.node-ops/config.toml"
+node-ops daemon
 ```
 
 In the client terminal:
 
 ```bash
-skills/node-ops/scripts/observe.py status
-skills/node-ops/scripts/observe.py pending
-skills/node-ops/scripts/observe.py audit --limit 10
+cd /path/to/lightning-agent-tools
+export PATH="$PWD/bin:$PATH"
+
+node-ops status
+node-ops pending
+node-ops audit --limit 10
 ```
 
 Expected result: status is `ok`, `pending` is empty, `monitor` is `enabled`,
@@ -272,7 +240,7 @@ and the audit query returns ledger entries for the read-only checks. If
 `monitor_error` is present, stop and fix the daemon's LND read connection before
 continuing.
 
-## 7. Propose and execute a gated fee-set
+## 6. Propose and execute a gated fee-set
 
 First use read-only proposal data from MCP in your agent session:
 
@@ -284,7 +252,7 @@ Choose a channel whose proposed fee delta is within the daemon limits.
 Render the exact local payload before submitting:
 
 ```bash
-skills/node-ops/scripts/propose.py fee-set \
+node-ops propose fee-set \
   --chan-id "$FEE_CHAN_ID" \
   --base-msat 1000 \
   --fee-ppm 100
@@ -295,7 +263,7 @@ Submit the request through the gated daemon path. In an MCP session, call
 fields. From the shell, use the bundled daemon client:
 
 ```bash
-FEE_RESPONSE="$(skills/node-ops/scripts/execute.py fee-set \
+FEE_RESPONSE="$(node-ops submit fee-set \
   --chan-id "$FEE_CHAN_ID" \
   --base-msat 1000 \
   --fee-ppm 100)"
@@ -309,7 +277,7 @@ execution; it only means the request is queued for operator review.
 Approve from the operator boundary:
 
 ```bash
-skills/node-ops/scripts/execute.py approve-fee-set --request-id "$FEE_REQUEST_ID" | jq .
+node-ops approve fee-set --request-id "$FEE_REQUEST_ID" | jq .
 ```
 
 Verify the channel policy and audit trail:
@@ -318,14 +286,14 @@ Verify the channel policy and audit trail:
 docker exec litd lncli --network=regtest feereport | jq --arg chan "$FEE_CHAN_ID" \
   '.channel_fees[] | select((.chan_id | tostring) == $chan)'
 
-skills/node-ops/scripts/observe.py audit --request-id "$FEE_REQUEST_ID" --oldest-first | jq .
+node-ops audit --request-id "$FEE_REQUEST_ID" --oldest-first | jq .
 ```
 
 Expected audit statuses for the original request: `pending` followed by
 `executed`. The operator approval request is a separate audit entry that points
 back to the original request id.
 
-## 8. Propose and execute a gated rebalance
+## 7. Propose and execute a gated rebalance
 
 A circular rebalance needs at least two local channels on the executing node.
 The two-channel setup above exports `OUTGOING_CHAN_ID` and `INCOMING_CHAN_ID`.
@@ -353,13 +321,13 @@ Render and submit the request. In an MCP session, call
 client:
 
 ```bash
-skills/node-ops/scripts/propose.py rebalance \
+node-ops propose rebalance \
   --outgoing-chan-id "$OUTGOING_CHAN_ID" \
   --incoming-chan-id "$INCOMING_CHAN_ID" \
   --amount-sat "$AMOUNT_SAT" \
   --max-fee-ppm "$MAX_FEE_PPM"
 
-REBALANCE_RESPONSE="$(skills/node-ops/scripts/execute.py rebalance \
+REBALANCE_RESPONSE="$(node-ops submit rebalance \
   --outgoing-chan-id "$OUTGOING_CHAN_ID" \
   --incoming-chan-id "$INCOMING_CHAN_ID" \
   --amount-sat "$AMOUNT_SAT" \
@@ -371,14 +339,14 @@ REBALANCE_REQUEST_ID="$(echo "$REBALANCE_RESPONSE" | jq -r '.request_id')"
 Approve from the operator boundary:
 
 ```bash
-skills/node-ops/scripts/execute.py approve-rebalance \
+node-ops approve rebalance \
   --request-id "$REBALANCE_REQUEST_ID" | jq .
 ```
 
 Verify the audit trail:
 
 ```bash
-skills/node-ops/scripts/observe.py audit \
+node-ops audit \
   --request-id "$REBALANCE_REQUEST_ID" \
   --oldest-first | jq .
 ```
@@ -388,7 +356,7 @@ Expected audit statuses for the original request: `pending` followed by
 `failed`, the daemon should report the LND reason, and reserved budget/cooldown
 state should roll back.
 
-## 9. Query the full ledger
+## 8. Query the full ledger
 
 The audit query can be run through MCP or the local read-only client:
 
@@ -401,8 +369,8 @@ Call lnc_query_node_ops_audit with
 ```
 
 ```bash
-skills/node-ops/scripts/observe.py audit --action execute_fee_set --oldest-first | jq .
-skills/node-ops/scripts/observe.py audit --action execute_rebalance --oldest-first | jq .
+node-ops audit --action execute_fee_set --oldest-first | jq .
+node-ops audit --action execute_rebalance --oldest-first | jq .
 ```
 
 The proof is complete when the ledger shows:
@@ -420,13 +388,13 @@ The proof is complete when the ledger shows:
 Run at least one rejection before teardown:
 
 ```bash
-skills/node-ops/scripts/execute.py fee-set \
+node-ops submit fee-set \
   --chan-id "$FEE_CHAN_ID" \
   --base-msat 1000 \
   --fee-ppm 1000000 || true
 
 touch "$HOME/.node-ops/STOP"
-skills/node-ops/scripts/execute.py rebalance \
+node-ops submit rebalance \
   --outgoing-chan-id "$OUTGOING_CHAN_ID" \
   --incoming-chan-id "$INCOMING_CHAN_ID" \
   --amount-sat "$AMOUNT_SAT" \
@@ -464,13 +432,13 @@ deadline=$((SECONDS + 60))
 while ! grep -q "Force-closing channel detected" "$ALERT_FILE" 2>/dev/null; do
   if [ "$SECONDS" -ge "$deadline" ]; then
     echo "timed out waiting for force-close alert" >&2
-    skills/node-ops/scripts/observe.py status | jq .
+    node-ops status | jq .
     exit 1
   fi
   sleep 2
 done
 
-tail -n 20 "$ALERT_FILE" |
+node-ops alerts --lines 20 |
   jq -s 'map(select(.id | startswith("channel:force-close:")))'
 ```
 
