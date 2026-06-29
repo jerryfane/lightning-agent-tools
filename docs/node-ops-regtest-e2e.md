@@ -199,9 +199,10 @@ skills/macaroon-bakery/scripts/bake.sh \
   --inspect "$HOME/.node-ops/node-ops.macaroon"
 ```
 
-The printed permissions should include `UpdateChannelPolicy` and
-`SendToRouteV2`, plus read RPCs needed to bound the action. It should not include
-open-channel, close-channel, or high-level payment RPCs.
+The printed permissions should include `UpdateChannelPolicy`, `SendToRouteV2`,
+and read RPCs needed to bound and monitor the action, including
+`PendingChannels` and `ListPeers`. It should not include open-channel,
+close-channel, or high-level payment RPCs.
 
 Copy the regtest TLS certificate from the container:
 
@@ -228,6 +229,11 @@ body = body.replace('tls_cert = "~/.lnd/tls.cert"',
                     f'tls_cert = "{Path.home()}/.node-ops/tls.cert"')
 body = body.replace('approval_token_file = "~/.node-ops/operator.token"',
                     f'approval_token_file = "{Path.home()}/.node-ops/operator.token"')
+body = body.replace('enabled = false', 'enabled = true')
+body = body.replace('poll_interval = "30s"', 'poll_interval = "2s"')
+body = body.replace('alert_cooldown = "10m"', 'alert_cooldown = "1m"')
+body = body.replace('alert_path = "~/.node-ops/alerts.jsonl"',
+                    f'alert_path = "{Path.home()}/.node-ops/alerts.jsonl"')
 body = body.replace('required_network = "regtest"', 'required_network = "regtest"')
 path.write_text(body)
 PY
@@ -261,8 +267,10 @@ skills/node-ops/scripts/observe.py pending
 skills/node-ops/scripts/observe.py audit --limit 10
 ```
 
-Expected result: status is `ok`, `pending` is empty, and the audit query returns
-ledger entries for the read-only checks.
+Expected result: status is `ok`, `pending` is empty, `monitor` is `enabled`,
+and the audit query returns ledger entries for the read-only checks. If
+`monitor_error` is present, stop and fix the daemon's LND read connection before
+continuing.
 
 ## 7. Propose and execute a gated fee-set
 
@@ -427,6 +435,47 @@ rm -f "$HOME/.node-ops/STOP"
 ```
 
 Each rejection must have an audit entry with the daemon reason.
+
+## Monitor force-close alert proof
+
+Force-close one disposable channel and wait for the background monitor to push a
+JSONL alert:
+
+```bash
+FORCE_CLOSE_POINT="$(
+  docker exec litd lncli --network=regtest listchannels |
+    jq -r --arg chan "$FEE_CHAN_ID" \
+      '.channels[] | select(((.scid // .chan_id) | tostring) == $chan) | .channel_point'
+)"
+if [ -z "$FORCE_CLOSE_POINT" ] || [ "$FORCE_CLOSE_POINT" = "null" ]; then
+  echo "could not find force-close channel point for $FEE_CHAN_ID" >&2
+  exit 1
+fi
+FORCE_TXID="${FORCE_CLOSE_POINT%:*}"
+FORCE_OUTPUT_INDEX="${FORCE_CLOSE_POINT##*:}"
+
+docker exec litd lncli --network=regtest closechannel \
+  --force \
+  --funding_txid="$FORCE_TXID" \
+  --output_index="$FORCE_OUTPUT_INDEX"
+
+ALERT_FILE="$HOME/.node-ops/alerts.jsonl"
+deadline=$((SECONDS + 60))
+while ! grep -q "Force-closing channel detected" "$ALERT_FILE" 2>/dev/null; do
+  if [ "$SECONDS" -ge "$deadline" ]; then
+    echo "timed out waiting for force-close alert" >&2
+    skills/node-ops/scripts/observe.py status | jq .
+    exit 1
+  fi
+  sleep 2
+done
+
+tail -n 20 "$ALERT_FILE" |
+  jq -s 'map(select(.id | startswith("channel:force-close:")))'
+```
+
+Expected result: at least one event with `severity: "critical"`,
+`category: "channel"`, and message `Force-closing channel detected`.
 
 ## Teardown
 

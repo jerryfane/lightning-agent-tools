@@ -282,6 +282,8 @@ if [ -n "$ROLE" ]; then
                 "uri:/lnrpc.Lightning/WalletBalance"
                 "uri:/lnrpc.Lightning/ChannelBalance"
                 "uri:/lnrpc.Lightning/ListChannels"
+                "uri:/lnrpc.Lightning/PendingChannels"
+                "uri:/lnrpc.Lightning/ListPeers"
                 "uri:/lnrpc.Lightning/GetChanInfo"
                 "uri:/lnrpc.Lightning/GetNodeInfo"
                 "uri:/lnrpc.Lightning/UpdateChannelPolicy"

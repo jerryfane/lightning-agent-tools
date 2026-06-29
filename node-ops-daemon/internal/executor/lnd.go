@@ -13,6 +13,7 @@ import (
 	"math"
 	"math/big"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -296,7 +297,136 @@ func (e *LNDExecutor) ExecuteRebalance(ctx context.Context,
 }
 
 func (e *LNDExecutor) NodeHealth(ctx context.Context) (NodeHealthSnapshot, error) {
-	return NodeHealthSnapshot{}, ErrNotImplemented
+	ctx, cancel := e.withRequestTimeout(ctx)
+	defer cancel()
+
+	info, err := e.requireNetworkInfo(ctx)
+	if err != nil {
+		return NodeHealthSnapshot{}, err
+	}
+
+	pending, err := e.client.PendingChannels(ctx, &lnrpc.PendingChannelsRequest{})
+	if err != nil {
+		return NodeHealthSnapshot{}, fmt.Errorf("pending channels: %w", err)
+	}
+
+	peers, err := e.client.ListPeers(ctx, &lnrpc.ListPeersRequest{})
+	if err != nil {
+		return NodeHealthSnapshot{}, fmt.Errorf("list peers: %w", err)
+	}
+
+	alerts := make([]HealthAlert, 0)
+	if !info.GetSyncedToChain() {
+		alerts = append(alerts, HealthAlert{
+			ID:       "sync:chain",
+			Severity: "critical",
+			Category: "sync",
+			Message:  "Node is NOT synced to chain",
+		})
+	}
+	if !info.GetSyncedToGraph() {
+		alerts = append(alerts, HealthAlert{
+			ID:       "sync:graph",
+			Severity: "warning",
+			Category: "sync",
+			Message:  "Node is NOT synced to graph",
+		})
+	}
+
+	for _, ch := range pending.GetPendingForceClosingChannels() {
+		channel := ch.GetChannel()
+		alerts = append(alerts, HealthAlert{
+			ID:       healthAlertID("channel:force-close", channel.GetChannelPoint()),
+			Severity: "critical",
+			Category: "channel",
+			Message:  "Force-closing channel detected",
+			Details: map[string]interface{}{
+				"channel_point":       channel.GetChannelPoint(),
+				"remote_node_pub":     channel.GetRemoteNodePub(),
+				"limbo_balance_sat":   ch.GetLimboBalance(),
+				"blocks_til_maturity": ch.GetBlocksTilMaturity(),
+				"closing_txid":        ch.GetClosingTxid(),
+			},
+		})
+	}
+
+	for _, ch := range pending.GetWaitingCloseChannels() {
+		channel := ch.GetChannel()
+		idPrefix := "channel:waiting-close"
+		severity := "warning"
+		message := "Channel waiting to close"
+		if waitingCloseLooksForceClosed(ch) {
+			idPrefix = "channel:force-close"
+			severity = "critical"
+			message = "Force-closing channel detected"
+		}
+		alerts = append(alerts, HealthAlert{
+			ID:       healthAlertID(idPrefix, channel.GetChannelPoint()),
+			Severity: severity,
+			Category: "channel",
+			Message:  message,
+			Details: map[string]interface{}{
+				"channel_point":     channel.GetChannelPoint(),
+				"remote_node_pub":   channel.GetRemoteNodePub(),
+				"limbo_balance_sat": ch.GetLimboBalance(),
+				"chan_status_flags": channel.GetChanStatusFlags(),
+				"closing_txid":      ch.GetClosingTxid(),
+			},
+		})
+	}
+
+	const flapThreshold = int32(10)
+	for _, peer := range peers.GetPeers() {
+		if peer.GetFlapCount() < flapThreshold {
+			continue
+		}
+		alerts = append(alerts, HealthAlert{
+			ID:       healthAlertID("peer:flap", peer.GetPubKey()),
+			Severity: "warning",
+			Category: "peer",
+			Message:  fmt.Sprintf("Peer has high flap count (%d)", peer.GetFlapCount()),
+			Details: map[string]interface{}{
+				"pub_key":    peer.GetPubKey(),
+				"address":    peer.GetAddress(),
+				"flap_count": peer.GetFlapCount(),
+			},
+		})
+	}
+
+	sort.SliceStable(alerts, func(i, j int) bool {
+		return healthSeverityRank(alerts[i].Severity) <
+			healthSeverityRank(alerts[j].Severity)
+	})
+
+	critical, warning := 0, 0
+	for _, alert := range alerts {
+		switch alert.Severity {
+		case "critical":
+			critical++
+		case "warning":
+			warning++
+		}
+	}
+
+	overall := "healthy"
+	if critical > 0 {
+		overall = "critical"
+	} else if warning > 0 {
+		overall = "degraded"
+	}
+
+	return NodeHealthSnapshot{
+		OverallStatus: overall,
+		AlertCount:    len(alerts),
+		CriticalCount: critical,
+		WarningCount:  warning,
+		Alerts:        alerts,
+		NodeID:        info.GetIdentityPubkey(),
+		Alias:         info.GetAlias(),
+		SyncedToChain: info.GetSyncedToChain(),
+		SyncedToGraph: info.GetSyncedToGraph(),
+		BlockHeight:   info.GetBlockHeight(),
+	}, nil
 }
 
 func (e *LNDExecutor) withRequestTimeout(ctx context.Context) (context.Context,
@@ -432,6 +562,35 @@ func formatFailedUpdates(updates []*lnrpc.FailedUpdate) string {
 		return errors.New("unknown failure").Error()
 	}
 	return strings.Join(parts, "; ")
+}
+
+func healthAlertID(prefix, key string) string {
+	if key == "" {
+		return prefix
+	}
+	return prefix + ":" + key
+}
+
+func healthSeverityRank(severity string) int {
+	switch severity {
+	case "critical":
+		return 0
+	case "warning":
+		return 1
+	default:
+		return 2
+	}
+}
+
+func waitingCloseLooksForceClosed(
+	ch *lnrpc.PendingChannelsResponse_WaitingCloseChannel) bool {
+
+	if ch == nil {
+		return false
+	}
+	flags := ch.GetChannel().GetChanStatusFlags()
+	return strings.Contains(flags, "ChanStatusBorked") ||
+		strings.Contains(flags, "ChanStatusCommitBroadcasted")
 }
 
 func decodePubKey(value string) ([]byte, error) {

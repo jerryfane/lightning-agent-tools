@@ -138,3 +138,94 @@ func TestHealthService_CriticalAlertsArePrioritized(t *testing.T) {
 	assert.Equal(t, "warning",
 		alerts[2].(map[string]any)["severity"])
 }
+
+func TestHealthService_WaitingCloseWithForceStatusIsCritical(t *testing.T) {
+	svc := NewHealthService(&mockHealthClient{
+		info: &lnrpc.GetInfoResponse{
+			IdentityPubkey: "node",
+			Alias:          "test-node",
+			SyncedToChain:  true,
+			SyncedToGraph:  true,
+			BlockHeight:    42,
+		},
+		pending: &lnrpc.PendingChannelsResponse{
+			WaitingCloseChannels: []*lnrpc.PendingChannelsResponse_WaitingCloseChannel{
+				{
+					Channel: &lnrpc.PendingChannelsResponse_PendingChannel{
+						ChannelPoint:    "waiting:1",
+						RemoteNodePub:   "remote-waiting",
+						ChanStatusFlags: "ChanStatusBorked|ChanStatusCommitBroadcasted",
+					},
+					LimboBalance: 5000,
+					Commitments:  &lnrpc.PendingChannelsResponse_Commitments{},
+					ClosingTxid:  "force-close-tx",
+				},
+			},
+		},
+		peers: &lnrpc.ListPeersResponse{},
+	})
+
+	result, err := svc.HandleNodeHealth(
+		context.Background(), &mcp.CallToolRequest{},
+	)
+	require.NoError(t, err)
+	require.False(t, result.IsError)
+
+	out := decodeHealthResult(t, result)
+	assert.Equal(t, "critical", out["overall_status"])
+	assert.Equal(t, float64(1), out["critical_count"])
+	assert.Equal(t, float64(0), out["warning_count"])
+
+	alerts := out["alerts"].([]any)
+	require.Len(t, alerts, 1)
+	alert := alerts[0].(map[string]any)
+	assert.Equal(t, "channel:force-close:waiting:1", alert["id"])
+	assert.Equal(t, "critical", alert["severity"])
+	assert.Equal(t, "Force-closing channel detected", alert["message"])
+	assert.Equal(t, "force-close-tx", alert["closing_txid"])
+}
+
+func TestHealthService_OrdinaryWaitingCloseWithCommitmentsIsWarning(t *testing.T) {
+	svc := NewHealthService(&mockHealthClient{
+		info: &lnrpc.GetInfoResponse{
+			IdentityPubkey: "node",
+			Alias:          "test-node",
+			SyncedToChain:  true,
+			SyncedToGraph:  true,
+			BlockHeight:    42,
+		},
+		pending: &lnrpc.PendingChannelsResponse{
+			WaitingCloseChannels: []*lnrpc.PendingChannelsResponse_WaitingCloseChannel{
+				{
+					Channel: &lnrpc.PendingChannelsResponse_PendingChannel{
+						ChannelPoint:  "waiting:1",
+						RemoteNodePub: "remote-waiting",
+					},
+					LimboBalance: 5000,
+					Commitments:  &lnrpc.PendingChannelsResponse_Commitments{},
+					ClosingTxid:  "close-tx",
+				},
+			},
+		},
+		peers: &lnrpc.ListPeersResponse{},
+	})
+
+	result, err := svc.HandleNodeHealth(
+		context.Background(), &mcp.CallToolRequest{},
+	)
+	require.NoError(t, err)
+	require.False(t, result.IsError)
+
+	out := decodeHealthResult(t, result)
+	assert.Equal(t, "degraded", out["overall_status"])
+	assert.Equal(t, float64(0), out["critical_count"])
+	assert.Equal(t, float64(1), out["warning_count"])
+
+	alerts := out["alerts"].([]any)
+	require.Len(t, alerts, 1)
+	alert := alerts[0].(map[string]any)
+	assert.Equal(t, "channel:waiting-close:waiting:1", alert["id"])
+	assert.Equal(t, "warning", alert["severity"])
+	assert.Equal(t, "Channel waiting to close", alert["message"])
+	assert.Equal(t, "close-tx", alert["closing_txid"])
+}
