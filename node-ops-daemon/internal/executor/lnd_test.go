@@ -47,7 +47,7 @@ func TestParseChannelPointRejectsInvalid(t *testing.T) {
 	}
 }
 
-func TestRebalanceFeeLimitSat(t *testing.T) {
+func TestRebalanceFeeLimitMsat(t *testing.T) {
 	tests := []struct {
 		name      string
 		amountSat int64
@@ -55,17 +55,18 @@ func TestRebalanceFeeLimitSat(t *testing.T) {
 		want      int64
 	}{
 		{name: "zero fee", amountSat: 1000, feePPM: 0, want: 0},
-		{name: "round up", amountSat: 999, feePPM: 1, want: 1},
-		{name: "exact", amountSat: 1_000_000, feePPM: 500, want: 500},
+		{name: "sub sat round up", amountSat: 1, feePPM: 500, want: 1},
+		{name: "exact one sat", amountSat: 2000, feePPM: 500, want: 1000},
+		{name: "exact larger", amountSat: 1_000_000, feePPM: 500, want: 500_000},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := rebalanceFeeLimitSat(tc.amountSat, tc.feePPM)
+			got, err := rebalanceFeeLimitMsat(tc.amountSat, tc.feePPM)
 			if err != nil {
-				t.Fatalf("rebalanceFeeLimitSat: %v", err)
+				t.Fatalf("rebalanceFeeLimitMsat: %v", err)
 			}
 			if got != tc.want {
-				t.Fatalf("fee limit = %d, want %d", got, tc.want)
+				t.Fatalf("fee limit msat = %d, want %d", got, tc.want)
 			}
 		})
 	}
@@ -110,5 +111,17 @@ func TestFeePPMFromMsat(t *testing.T) {
 	}
 	if got != 334 {
 		t.Fatalf("fee ppm should round up, got %d", got)
+	}
+}
+
+func TestVerifyRouteFeeUsesMsatLimit(t *testing.T) {
+	route := &lnrpc.Route{TotalFeesMsat: 2}
+	if err := verifyRouteFee(route, 1); err == nil ||
+		!strings.Contains(err.Error(), "msat") {
+
+		t.Fatalf("expected msat fee-limit rejection, got %v", err)
+	}
+	if err := verifyRouteFee(route, 2); err != nil {
+		t.Fatalf("verifyRouteFee should allow exact msat limit: %v", err)
 	}
 }

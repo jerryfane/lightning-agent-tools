@@ -232,7 +232,7 @@ func (e *LNDExecutor) ExecuteRebalance(ctx context.Context,
 	if err != nil {
 		return RebalanceResult{}, fmt.Errorf("decode incoming channel peer pubkey: %w", err)
 	}
-	feeLimit, err := rebalanceFeeLimitSat(req.AmountSat, req.MaxFeePpm)
+	feeLimitMsat, err := rebalanceFeeLimitMsat(req.AmountSat, req.MaxFeePpm)
 	if err != nil {
 		return RebalanceResult{}, err
 	}
@@ -244,7 +244,7 @@ func (e *LNDExecutor) ExecuteRebalance(ctx context.Context,
 	routes, err := e.client.QueryRoutes(ctx, &lnrpc.QueryRoutesRequest{
 		PubKey:            info.GetIdentityPubkey(),
 		Amt:               req.AmountSat,
-		FeeLimit:          fixedFeeLimit(feeLimit),
+		FeeLimit:          fixedMsatFeeLimit(feeLimitMsat),
 		UseMissionControl: true,
 		OutgoingChanId:    req.OutgoingChanID,
 		LastHopPubkey:     incomingPeerBytes,
@@ -262,7 +262,7 @@ func (e *LNDExecutor) ExecuteRebalance(ctx context.Context,
 	if err := verifyRebalanceRoute(route, req); err != nil {
 		return RebalanceResult{}, err
 	}
-	if err := verifyRouteFee(route, feeLimit); err != nil {
+	if err := verifyRouteFee(route, feeLimitMsat); err != nil {
 		return RebalanceResult{}, err
 	}
 
@@ -454,11 +454,13 @@ func newKeysendPreimage() ([32]byte, [32]byte, error) {
 	return preimage, sha256.Sum256(preimage[:]), nil
 }
 
-func fixedFeeLimit(feeSat int64) *lnrpc.FeeLimit {
-	return &lnrpc.FeeLimit{Limit: &lnrpc.FeeLimit_Fixed{Fixed: feeSat}}
+func fixedMsatFeeLimit(feeMsat int64) *lnrpc.FeeLimit {
+	return &lnrpc.FeeLimit{
+		Limit: &lnrpc.FeeLimit_FixedMsat{FixedMsat: feeMsat},
+	}
 }
 
-func rebalanceFeeLimitSat(amountSat, maxFeePpm int64) (int64, error) {
+func rebalanceFeeLimitMsat(amountSat, maxFeePpm int64) (int64, error) {
 	if amountSat <= 0 {
 		return 0, fmt.Errorf("amount_sat must be positive")
 	}
@@ -466,8 +468,8 @@ func rebalanceFeeLimitSat(amountSat, maxFeePpm int64) (int64, error) {
 		return 0, fmt.Errorf("max_fee_ppm must be non-negative")
 	}
 	n := new(big.Int).Mul(big.NewInt(amountSat), big.NewInt(maxFeePpm))
-	n.Add(n, big.NewInt(999_999))
-	n.Div(n, big.NewInt(1_000_000))
+	n.Add(n, big.NewInt(999))
+	n.Div(n, big.NewInt(1000))
 	if !n.IsInt64() {
 		return 0, fmt.Errorf("fee limit overflows int64")
 	}
@@ -491,11 +493,11 @@ func verifyRebalanceRoute(route *lnrpc.Route, req RebalanceRequest) error {
 	return nil
 }
 
-func verifyRouteFee(route *lnrpc.Route, feeLimitSat int64) error {
-	feeSat := msatToSatCeil(route.GetTotalFeesMsat())
-	if feeSat > feeLimitSat {
-		return fmt.Errorf("query rebalance route: fee %d sat exceeds max fee %d sat",
-			feeSat, feeLimitSat)
+func verifyRouteFee(route *lnrpc.Route, feeLimitMsat int64) error {
+	feeMsat := route.GetTotalFeesMsat()
+	if feeMsat > feeLimitMsat {
+		return fmt.Errorf("query rebalance route: fee %d msat exceeds max fee %d msat",
+			feeMsat, feeLimitMsat)
 	}
 	return nil
 }
