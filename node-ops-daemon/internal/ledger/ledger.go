@@ -9,6 +9,7 @@ package ledger
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver, no CGO required
@@ -18,12 +19,23 @@ const driverName = "sqlite"
 
 // Entry is a single immutable record in the ledger.
 type Entry struct {
+	ID        int64
 	RequestID string
 	Action    string
 	Params    string // JSON-encoded params
 	Status    string // "accepted" | "pending" | "executed" | "rejected" | "failed" | "ok"
 	Reason    string // human-readable explanation (empty for success)
 	CreatedAt time.Time
+}
+
+// QueryOptions filters audit ledger entries.
+type QueryOptions struct {
+	RequestID   string
+	Action      string
+	Status      string
+	Limit       int
+	Offset      int
+	NewestFirst bool
 }
 
 // Ledger is a write-only audit log backed by SQLite.
@@ -87,9 +99,49 @@ func (l *Ledger) Record(e Entry) error {
 
 // List returns all entries in insertion order. For testing and diagnostics only.
 func (l *Ledger) List() ([]Entry, error) {
-	rows, err := l.db.Query(
-		`SELECT request_id, action, params, status, reason, created_at
-		 FROM actions ORDER BY id ASC`)
+	return l.Query(QueryOptions{})
+}
+
+// Query returns entries matching opts. Results are ordered by insertion id,
+// ascending by default or descending when NewestFirst is set.
+func (l *Ledger) Query(opts QueryOptions) ([]Entry, error) {
+	query := `SELECT id, request_id, action, params, status, reason, created_at
+		 FROM actions`
+	var where []string
+	var args []any
+	if opts.RequestID != "" {
+		where = append(where, "request_id = ?")
+		args = append(args, opts.RequestID)
+	}
+	if opts.Action != "" {
+		where = append(where, "action = ?")
+		args = append(args, opts.Action)
+	}
+	if opts.Status != "" {
+		where = append(where, "status = ?")
+		args = append(args, opts.Status)
+	}
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	order := "ASC"
+	if opts.NewestFirst {
+		order = "DESC"
+	}
+	query += " ORDER BY id " + order
+	if opts.Limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, opts.Limit)
+		if opts.Offset > 0 {
+			query += " OFFSET ?"
+			args = append(args, opts.Offset)
+		}
+	} else if opts.Offset > 0 {
+		query += " LIMIT -1 OFFSET ?"
+		args = append(args, opts.Offset)
+	}
+
+	rows, err := l.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -99,10 +151,16 @@ func (l *Ledger) List() ([]Entry, error) {
 	for rows.Next() {
 		var e Entry
 		var ts string
-		if err := rows.Scan(&e.RequestID, &e.Action, &e.Params, &e.Status, &e.Reason, &ts); err != nil {
+		if err := rows.Scan(&e.ID, &e.RequestID, &e.Action, &e.Params,
+			&e.Status, &e.Reason, &ts); err != nil {
+
 			return nil, err
 		}
-		e.CreatedAt, _ = time.Parse(time.RFC3339, ts)
+		createdAt, err := time.Parse(time.RFC3339, ts)
+		if err != nil {
+			return nil, fmt.Errorf("parse ledger timestamp %q: %w", ts, err)
+		}
+		e.CreatedAt = createdAt
 		entries = append(entries, e)
 	}
 	return entries, rows.Err()

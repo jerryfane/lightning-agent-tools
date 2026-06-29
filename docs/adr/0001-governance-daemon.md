@@ -140,7 +140,7 @@ graph TD
 - #7 scoped macaroon → consumed by the daemon.
 - #8 daemon skeleton (limits + approval queue + ledger + kill-switch) implements this ADR.
 - #9 `execute_fee_set`, #10 `execute_rebalance` → thin MCP clients over the socket.
-- #11 limits hardening, #12 ledger query tool.
+- #11 limits hardening, #12 daemon/MCP ledger query tool.
 
 ## Alternatives considered
 

@@ -75,6 +75,64 @@ func TestRecord_AppendOnly(t *testing.T) {
 	if len(entries) != 5 {
 		t.Fatalf("expected 5 entries (append-only), got %d", len(entries))
 	}
+	for i, entry := range entries {
+		if entry.ID != int64(i+1) {
+			t.Fatalf("entry %d id = %d, want %d", i, entry.ID, i+1)
+		}
+	}
+}
+
+func TestQuery_FiltersAndPagination(t *testing.T) {
+	l := openTemp(t)
+
+	entries := []ledger.Entry{
+		{
+			RequestID: "req-1",
+			Action:    "execute_fee_set",
+			Status:    "pending",
+			CreatedAt: time.Now().UTC(),
+		},
+		{
+			RequestID: "req-1",
+			Action:    "execute_fee_set",
+			Status:    "executed",
+			CreatedAt: time.Now().UTC(),
+		},
+		{
+			RequestID: "req-2",
+			Action:    "status",
+			Status:    "ok",
+			CreatedAt: time.Now().UTC(),
+		},
+	}
+	for _, entry := range entries {
+		if err := l.Record(entry); err != nil {
+			t.Fatalf("Record: %v", err)
+		}
+	}
+
+	filtered, err := l.Query(ledger.QueryOptions{
+		Action:      "execute_fee_set",
+		RequestID:   "req-1",
+		NewestFirst: true,
+		Limit:       1,
+	})
+	if err != nil {
+		t.Fatalf("Query filtered: %v", err)
+	}
+	if len(filtered) != 1 || filtered[0].Status != "executed" {
+		t.Fatalf("unexpected filtered query results: %+v", filtered)
+	}
+
+	paged, err := l.Query(ledger.QueryOptions{Limit: 1, Offset: 1})
+	if err != nil {
+		t.Fatalf("Query paged: %v", err)
+	}
+	if len(paged) != 1 || paged[0].RequestID != "req-1" ||
+		paged[0].Status != "executed" {
+
+		t.Fatalf("unexpected paged query result: %+v", paged)
+	}
 }
 
 func TestRecord_ConcurrentWrites(t *testing.T) {
