@@ -22,6 +22,14 @@ func TestStubExecutorFailsClosed(t *testing.T) {
 	if !errors.Is(err, executor.ErrNotImplemented) {
 		t.Fatalf("ExecuteFeeSet error = %v, want ErrNotImplemented", err)
 	}
+	if _, err := stub.ExecuteRebalance(context.Background(), executor.RebalanceRequest{
+		OutgoingChanID: 1,
+		IncomingChanID: 2,
+		AmountSat:      100,
+		MaxFeePpm:      50,
+	}); !errors.Is(err, executor.ErrNotImplemented) {
+		t.Fatalf("ExecuteRebalance error = %v, want ErrNotImplemented", err)
+	}
 	if _, err := stub.NodeHealth(context.Background()); !errors.Is(err, executor.ErrNotImplemented) {
 		t.Fatalf("NodeHealth error = %v, want ErrNotImplemented", err)
 	}

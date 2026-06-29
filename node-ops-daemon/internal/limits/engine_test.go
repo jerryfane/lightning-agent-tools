@@ -183,6 +183,58 @@ func TestPersistentDailyBudgetSurvivesRestart(t *testing.T) {
 	}
 }
 
+func TestReserveRebalanceOperationPersistsBudgetAndCooldowns(t *testing.T) {
+	cfg := config.Limits{
+		DailyRebalanceBudgetSat: 1000,
+		MaxFeePpmDelta:          1000,
+		PerChannelCooldown:      "1h",
+		RebalanceMaxFeePpm:      1000,
+	}
+	path := filepath.Join(t.TempDir(), "limits-state.json")
+
+	eng := newPersistentEngine(t, cfg, path)
+	if _, err := eng.ReserveRebalanceOperation([]uint64{1, 2}, 600, 100); err != nil {
+		t.Fatalf("ReserveRebalanceOperation: %v", err)
+	}
+	if err := eng.RecordRebalanceOperation([]uint64{1, 2}); err != nil {
+		t.Fatalf("RecordRebalanceOperation: %v", err)
+	}
+
+	restarted := newPersistentEngine(t, cfg, path)
+	if err := restarted.CheckRebalanceChannels([]uint64{3, 4}, 500, 100); err == nil {
+		t.Fatal("expected persisted daily budget exhaustion after restart")
+	}
+	if err := restarted.CheckRebalanceChannels([]uint64{3, 2}, 100, 100); err == nil ||
+		!strings.Contains(err.Error(), "cooldown") {
+
+		t.Fatalf("expected persisted incoming channel cooldown, got %v", err)
+	}
+}
+
+func TestRollbackRebalanceOperationRestoresBudgetAndCooldowns(t *testing.T) {
+	cfg := config.Limits{
+		DailyRebalanceBudgetSat: 1000,
+		MaxFeePpmDelta:          1000,
+		PerChannelCooldown:      "1h",
+		RebalanceMaxFeePpm:      1000,
+	}
+	path := filepath.Join(t.TempDir(), "limits-state.json")
+
+	eng := newPersistentEngine(t, cfg, path)
+	reservation, err := eng.ReserveRebalanceOperation([]uint64{42, 43}, 1000, 100)
+	if err != nil {
+		t.Fatalf("ReserveRebalanceOperation: %v", err)
+	}
+	if err := eng.RollbackRebalanceOperation(reservation); err != nil {
+		t.Fatalf("RollbackRebalanceOperation: %v", err)
+	}
+
+	restarted := newPersistentEngine(t, cfg, path)
+	if _, err := restarted.ReserveRebalanceOperation([]uint64{42, 43}, 1000, 100); err != nil {
+		t.Fatalf("rollback should restore budget and cooldowns: %v", err)
+	}
+}
+
 func TestPersistentFeeSetBudgetSurvivesRestart(t *testing.T) {
 	cfg := config.Limits{
 		DailyRebalanceBudgetSat: 1000,

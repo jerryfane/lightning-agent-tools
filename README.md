@@ -254,7 +254,7 @@ Export credentials from my signer and set up a watch-only node
 | **macaroon-bakery** | Bakes scoped macaroons (pay-only, invoice-only, read-only, channel-admin, signer-only) for least-privilege access. |
 | **lnget** | Command-line HTTP client with automatic L402 payment. Pays Lightning invoices on 402 responses, caches tokens, retries. |
 | **aperture** | L402 reverse proxy. Sits in front of a backend service, issues invoices, validates paid tokens, proxies authorized requests. |
-| **lightning-mcp-server** | Builds and configures the MCP server for LNC-based read-only access to a Lightning node. 18 tools, no stored credentials. |
+| **lightning-mcp-server** | Builds and configures the MCP server for LNC-based read-only access plus daemon-gated node-ops requests. 24 tools, no stored credentials. |
 | **commerce** | Meta-skill orchestrating lnd + lnget + aperture for end-to-end buyer/seller workflows. |
 
 All scripts support `--container` for Docker-based lnd nodes and `--rpcserver`

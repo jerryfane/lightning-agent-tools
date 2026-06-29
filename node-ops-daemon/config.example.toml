@@ -18,10 +18,11 @@ per_channel_cooldown = "1h"
 rebalance_max_fee_ppm = 500
 
 [approval]
-# Reserved for future action types. Fee-set execution always requires approval.
+# Reserved for future action types. Fee-set and rebalance execution always
+# require approval.
 auto_execute_below_ppm_delta = 20
 
-# Fee-set execution is queued for human review regardless of size.
+# Fee-set and rebalance execution are queued for human review regardless of size.
 require_approval = true
 
 [storage]
@@ -35,8 +36,8 @@ limits_state = "~/.node-ops/limits-state.json"
 killswitch = "~/.node-ops/STOP"
 
 [node]
-# LND gRPC endpoint controlled by the daemon. The first gated write path is
-# regtest-only; mainnet is intentionally rejected.
+# LND gRPC endpoint controlled by the daemon. Gated write paths are regtest-only;
+# mainnet is intentionally rejected.
 lnd_rpc = "127.0.0.1:10009"
 required_network = "regtest"
 

@@ -28,19 +28,20 @@ type Manager struct {
 	lightningClient lnrpc.LightningClient
 
 	// Services. Most LNC tools are read-only; node-ops writes are daemon gated.
-	connectionService     *tools.ConnectionService
-	invoiceService        *tools.InvoiceService
-	channelService        *tools.ChannelService
-	channelActionsService *tools.ChannelActionsService
-	paymentService        *tools.PaymentService
-	onchainService        *tools.OnChainService
-	peerService           *tools.PeerService
-	nodeService           *tools.NodeService
-	healthService         *tools.HealthService
-	rebalanceService      *tools.RebalanceService
-	feeService            *tools.FeeService
-	nodeOpsAuditService   *tools.NodeOpsAuditService
-	nodeOpsFeeSetService  *tools.NodeOpsFeeSetService
+	connectionService       *tools.ConnectionService
+	invoiceService          *tools.InvoiceService
+	channelService          *tools.ChannelService
+	channelActionsService   *tools.ChannelActionsService
+	paymentService          *tools.PaymentService
+	onchainService          *tools.OnChainService
+	peerService             *tools.PeerService
+	nodeService             *tools.NodeService
+	healthService           *tools.HealthService
+	rebalanceService        *tools.RebalanceService
+	feeService              *tools.FeeService
+	nodeOpsAuditService     *tools.NodeOpsAuditService
+	nodeOpsFeeSetService    *tools.NodeOpsFeeSetService
+	nodeOpsRebalanceService *tools.NodeOpsRebalanceService
 }
 
 // NewManager creates a new service manager.
@@ -73,6 +74,8 @@ func (m *Manager) InitializeServices() {
 	m.nodeOpsAuditService = tools.NewNodeOpsAuditService(
 		tools.DefaultNodeOpsDaemonSocket())
 	m.nodeOpsFeeSetService = tools.NewNodeOpsFeeSetService(
+		tools.DefaultNodeOpsDaemonSocket())
+	m.nodeOpsRebalanceService = tools.NewNodeOpsRebalanceService(
 		tools.DefaultNodeOpsDaemonSocket())
 
 	m.logger.Info("MCP services initialized successfully")
@@ -163,6 +166,10 @@ func (m *Manager) RegisterTools(mcpServer interfaces.MCPServer) error {
 	// Node-ops fee-set tool - gated local daemon write request.
 	register(m.nodeOpsFeeSetService.ExecuteFeeSetTool(),
 		m.nodeOpsFeeSetService.HandleExecuteFeeSet)
+
+	// Node-ops rebalance tool - gated local daemon write request.
+	register(m.nodeOpsRebalanceService.ExecuteRebalanceTool(),
+		m.nodeOpsRebalanceService.HandleExecuteRebalance)
 
 	m.logger.Info("MCP tools registered",
 		zap.Int("total_tools", registrations))

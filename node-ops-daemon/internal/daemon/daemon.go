@@ -316,6 +316,8 @@ func (d *Daemon) dispatch(req Request) Response {
 	switch req.Action {
 	case "execute_fee_set":
 		return d.handleFeeSet(reqID, req.Params)
+	case "execute_rebalance":
+		return d.handleRebalance(reqID, req.Params)
 	case "query_audit_log":
 		return d.handleQueryAuditLog(reqID, req.Params)
 	case "list_pending":
@@ -360,6 +362,10 @@ func (d *Daemon) dispatchOperator(req Request) Response {
 		return d.handleApproveFeeSet(reqID, req.Params)
 	case "deny_fee_set":
 		return d.handleDenyFeeSet(reqID, req.Params)
+	case "approve_rebalance":
+		return d.handleApproveRebalance(reqID, req.Params)
+	case "deny_rebalance":
+		return d.handleDenyRebalance(reqID, req.Params)
 	case "list_pending":
 		return d.handleListPending(reqID)
 	case "status":
@@ -617,6 +623,21 @@ type rawFeeSetParams struct {
 	FeePpm   *int64  `json:"fee_ppm"`
 }
 
+// rebalanceParams are the parameters for the execute_rebalance action.
+type rebalanceParams struct {
+	OutgoingChanID uint64 `json:"outgoing_chan_id"`
+	IncomingChanID uint64 `json:"incoming_chan_id"`
+	AmountSat      int64  `json:"amount_sat"`
+	MaxFeePpm      int64  `json:"max_fee_ppm"`
+}
+
+type rawRebalanceParams struct {
+	OutgoingChanID *uint64 `json:"outgoing_chan_id"`
+	IncomingChanID *uint64 `json:"incoming_chan_id"`
+	AmountSat      *int64  `json:"amount_sat"`
+	MaxFeePpm      *int64  `json:"max_fee_ppm"`
+}
+
 type approvalParams struct {
 	RequestID string `json:"request_id"`
 	Reason    string `json:"reason"`
@@ -678,6 +699,40 @@ func (d *Daemon) handleFeeSet(reqID string, raw json.RawMessage) Response {
 	return d.queueFeeSet(reqID, raw)
 }
 
+func (d *Daemon) handleRebalance(reqID string, raw json.RawMessage) Response {
+	if resp, stopped := d.rejectIfKillSwitchActive(reqID, "execute_rebalance",
+		raw); stopped {
+
+		return resp
+	}
+
+	p, err := parseRebalanceParams(raw)
+	if err != nil {
+		if recErr := d.record(reqID, "execute_rebalance", raw, "rejected",
+			"invalid params: "+err.Error()); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: "invalid params: " + err.Error()}
+	}
+	if err := d.limits.CheckRebalanceChannels(
+		rebalanceLimitChannels(p), p.AmountSat, p.MaxFeePpm,
+	); err != nil {
+		if recErr := d.record(reqID, "execute_rebalance", raw, "rejected",
+			err.Error()); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
+	}
+	if resp, stopped := d.rejectIfKillSwitchActive(reqID, "execute_rebalance",
+		raw); stopped {
+
+		return resp
+	}
+	return d.queueRebalance(reqID, raw)
+}
+
 func parseApprovalParams(raw json.RawMessage) (approvalParams, error) {
 	var params approvalParams
 	if err := json.Unmarshal(raw, &params); err != nil {
@@ -719,6 +774,50 @@ func parseFeeSetParams(raw json.RawMessage) (feeSetParams, error) {
 		BaseMsat: *rawParams.BaseMsat,
 		FeePpm:   *rawParams.FeePpm,
 	}, nil
+}
+
+func parseRebalanceParams(raw json.RawMessage) (rebalanceParams, error) {
+	var rawParams rawRebalanceParams
+	if err := json.Unmarshal(raw, &rawParams); err != nil {
+		return rebalanceParams{}, err
+	}
+	if rawParams.OutgoingChanID == nil {
+		return rebalanceParams{}, fmt.Errorf("missing outgoing_chan_id")
+	}
+	if rawParams.IncomingChanID == nil {
+		return rebalanceParams{}, fmt.Errorf("missing incoming_chan_id")
+	}
+	if rawParams.AmountSat == nil {
+		return rebalanceParams{}, fmt.Errorf("missing amount_sat")
+	}
+	if rawParams.MaxFeePpm == nil {
+		return rebalanceParams{}, fmt.Errorf("missing max_fee_ppm")
+	}
+	if *rawParams.OutgoingChanID == 0 {
+		return rebalanceParams{}, fmt.Errorf("outgoing_chan_id must be non-zero")
+	}
+	if *rawParams.IncomingChanID == 0 {
+		return rebalanceParams{}, fmt.Errorf("incoming_chan_id must be non-zero")
+	}
+	if *rawParams.OutgoingChanID == *rawParams.IncomingChanID {
+		return rebalanceParams{}, fmt.Errorf("incoming_chan_id must differ from outgoing_chan_id")
+	}
+	if *rawParams.AmountSat <= 0 {
+		return rebalanceParams{}, fmt.Errorf("amount_sat must be positive")
+	}
+	if *rawParams.MaxFeePpm < 0 {
+		return rebalanceParams{}, fmt.Errorf("max_fee_ppm must be non-negative")
+	}
+	return rebalanceParams{
+		OutgoingChanID: *rawParams.OutgoingChanID,
+		IncomingChanID: *rawParams.IncomingChanID,
+		AmountSat:      *rawParams.AmountSat,
+		MaxFeePpm:      *rawParams.MaxFeePpm,
+	}, nil
+}
+
+func rebalanceLimitChannels(p rebalanceParams) []uint64 {
+	return []uint64{p.OutgoingChanID, p.IncomingChanID}
 }
 
 func prepareLedgerDir(dir string) error {
@@ -824,7 +923,7 @@ func (d *Daemon) handleApproveFeeSet(reqID string, raw json.RawMessage) Response
 			Reason: "invalid params: " + err.Error()}
 	}
 
-	item, ok := d.queue.Approve(params.RequestID)
+	item, ok := d.queue.ApproveAction(params.RequestID, "execute_fee_set")
 	if !ok {
 		reason := "pending request not found"
 		if recErr := d.record(reqID, "approve_fee_set", raw, "rejected",
@@ -883,7 +982,7 @@ func (d *Daemon) handleDenyFeeSet(reqID string, raw json.RawMessage) Response {
 	if reason == "" {
 		reason = "operator denied"
 	}
-	item, ok := d.queue.Reject(params.RequestID, reason)
+	item, ok := d.queue.RejectAction(params.RequestID, "execute_fee_set", reason)
 	if !ok {
 		if recErr := d.record(reqID, "deny_fee_set", raw, "rejected",
 			"pending request not found"); recErr != nil {
@@ -899,6 +998,107 @@ func (d *Daemon) handleDenyFeeSet(reqID string, raw json.RawMessage) Response {
 		return ledgerFailure(reqID, recErr)
 	}
 	if recErr := d.record(item.RequestID, "execute_fee_set",
+		json.RawMessage(item.Params), "denied", reason); recErr != nil {
+
+		return ledgerFailure(reqID, recErr)
+	}
+	return Response{
+		Status:    "ok",
+		RequestID: reqID,
+		Result: map[string]interface{}{
+			"denied_request_id": item.RequestID,
+			"reason":            reason,
+		},
+	}
+}
+
+func (d *Daemon) handleApproveRebalance(reqID string, raw json.RawMessage) Response {
+	params, err := parseApprovalParams(raw)
+	if err != nil {
+		if recErr := d.record(reqID, "approve_rebalance", raw, "rejected",
+			"invalid params: "+err.Error()); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID,
+			Reason: "invalid params: " + err.Error()}
+	}
+
+	item, ok := d.queue.ApproveAction(params.RequestID, "execute_rebalance")
+	if !ok {
+		reason := "pending request not found"
+		if recErr := d.record(reqID, "approve_rebalance", raw, "rejected",
+			reason); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: reason}
+	}
+	if recErr := d.record(reqID, "approve_rebalance", raw, "approved",
+		item.RequestID); recErr != nil {
+
+		return ledgerFailure(reqID, recErr)
+	}
+
+	p, err := parseRebalanceParams(json.RawMessage(item.Params))
+	if err != nil {
+		reason := "queued params invalid: " + err.Error()
+		if recErr := d.record(item.RequestID, "execute_rebalance",
+			json.RawMessage(item.Params), "failed", reason); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: reason}
+	}
+
+	execResp := d.executeRebalance(
+		item.RequestID, json.RawMessage(item.Params), p, true,
+	)
+	if execResp.Status != "ok" {
+		return execResp
+	}
+	return Response{
+		Status:    "ok",
+		RequestID: reqID,
+		Result: map[string]interface{}{
+			"approved_request_id": item.RequestID,
+			"execution":           execResp,
+		},
+	}
+}
+
+func (d *Daemon) handleDenyRebalance(reqID string, raw json.RawMessage) Response {
+	params, err := parseApprovalParams(raw)
+	if err != nil {
+		if recErr := d.record(reqID, "deny_rebalance", raw, "rejected",
+			"invalid params: "+err.Error()); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID,
+			Reason: "invalid params: " + err.Error()}
+	}
+
+	reason := params.Reason
+	if reason == "" {
+		reason = "operator denied"
+	}
+	item, ok := d.queue.RejectAction(params.RequestID, "execute_rebalance", reason)
+	if !ok {
+		if recErr := d.record(reqID, "deny_rebalance", raw, "rejected",
+			"pending request not found"); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID,
+			Reason: "pending request not found"}
+	}
+	if recErr := d.record(reqID, "deny_rebalance", raw, "denied",
+		reason); recErr != nil {
+
+		return ledgerFailure(reqID, recErr)
+	}
+	if recErr := d.record(item.RequestID, "execute_rebalance",
 		json.RawMessage(item.Params), "denied", reason); recErr != nil {
 
 		return ledgerFailure(reqID, recErr)
@@ -1011,6 +1211,104 @@ func (d *Daemon) executeFeeSet(reqID string, raw json.RawMessage,
 		Result: map[string]interface{}{"executed": true, "chan_id": p.ChanID}}
 }
 
+func (d *Daemon) executeRebalance(reqID string, raw json.RawMessage,
+	p rebalanceParams, approvalSatisfied bool) Response {
+
+	d.execMu.Lock()
+	defer d.execMu.Unlock()
+
+	if err := d.limits.CheckRebalanceChannels(
+		rebalanceLimitChannels(p), p.AmountSat, p.MaxFeePpm,
+	); err != nil {
+		if recErr := d.record(reqID, "execute_rebalance", raw, "rejected",
+			err.Error()); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
+	}
+	if !approvalSatisfied {
+		if resp, stopped := d.rejectIfKillSwitchActive(reqID, "execute_rebalance",
+			raw); stopped {
+
+			return resp
+		}
+		return d.queueRebalance(reqID, raw)
+	}
+	if resp, stopped := d.rejectIfKillSwitchActive(reqID, "execute_rebalance",
+		raw); stopped {
+
+		return resp
+	}
+	reservation, err := d.limits.ReserveRebalanceOperation(
+		rebalanceLimitChannels(p), p.AmountSat, p.MaxFeePpm,
+	)
+	if err != nil {
+		if recErr := d.record(reqID, "execute_rebalance", raw, "rejected",
+			err.Error()); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
+	}
+	if killswitch.Active(d.cfg.Storage.KillswitchFile) {
+		reason := "killswitch active: all execution is halted"
+		if rollbackErr := d.limits.RollbackRebalanceOperation(reservation); rollbackErr != nil {
+			reason = reason + "; limits rollback failed: " + rollbackErr.Error()
+		}
+		if recErr := d.record(reqID, "execute_rebalance", raw, "rejected",
+			"killswitch active"); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: reason}
+	}
+	if err := d.record(reqID, "execute_rebalance", raw, "accepted", ""); err != nil {
+		_ = d.limits.RollbackRebalanceOperation(reservation)
+		return ledgerFailure(reqID, err)
+	}
+	result, err := d.executor.ExecuteRebalance(context.Background(),
+		executor.RebalanceRequest{
+			OutgoingChanID: p.OutgoingChanID,
+			IncomingChanID: p.IncomingChanID,
+			AmountSat:      p.AmountSat,
+			MaxFeePpm:      p.MaxFeePpm,
+		})
+	if err != nil {
+		reason := err.Error()
+		if rollbackErr := d.limits.RollbackRebalanceOperation(reservation); rollbackErr != nil {
+			reason = reason + "; limits rollback failed: " + rollbackErr.Error()
+		}
+		if recErr := d.record(reqID, "execute_rebalance", raw, "failed",
+			reason); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: reason}
+	}
+	if err := d.limits.RecordRebalanceOperation(rebalanceLimitChannels(p)); err != nil {
+		reason := "limits state refresh failed: " + err.Error()
+		if recErr := d.record(reqID, "execute_rebalance", raw, "executed",
+			reason); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		out := rebalanceResult(p, result)
+		out["warning"] = reason
+		return Response{Status: "ok", RequestID: reqID, Result: out}
+	}
+	if err := d.record(reqID, "execute_rebalance", raw, "executed",
+		rebalanceAuditReason(result)); err != nil {
+
+		return ledgerFailure(reqID, err)
+	}
+	return Response{
+		Status:    "ok",
+		RequestID: reqID,
+		Result:    rebalanceResult(p, result),
+	}
+}
+
 func (d *Daemon) queueFeeSet(reqID string, raw json.RawMessage) Response {
 	if err := d.record(reqID, "execute_fee_set", raw, "pending", ""); err != nil {
 		return ledgerFailure(reqID, err)
@@ -1023,6 +1321,42 @@ func (d *Daemon) queueFeeSet(reqID string, raw json.RawMessage) Response {
 		Status: "pending", RequestID: reqID,
 		Result: map[string]interface{}{"queued": true, "request_id": reqID},
 	}
+}
+
+func (d *Daemon) queueRebalance(reqID string, raw json.RawMessage) Response {
+	if err := d.record(reqID, "execute_rebalance", raw, "pending", ""); err != nil {
+		return ledgerFailure(reqID, err)
+	}
+	d.queue.Enqueue(queue.Item{
+		RequestID: reqID, Action: "execute_rebalance",
+		Params: string(raw), CreatedAt: time.Now(),
+	})
+	return Response{
+		Status: "pending", RequestID: reqID,
+		Result: map[string]interface{}{"queued": true, "request_id": reqID},
+	}
+}
+
+func rebalanceResult(p rebalanceParams,
+	result executor.RebalanceResult) map[string]interface{} {
+
+	return map[string]interface{}{
+		"executed":         true,
+		"outgoing_chan_id": p.OutgoingChanID,
+		"incoming_chan_id": p.IncomingChanID,
+		"amount_sat":       result.AmountSat,
+		"max_fee_ppm":      p.MaxFeePpm,
+		"fee_sat":          result.FeeSat,
+		"fee_ppm":          result.FeePpm,
+		"payment_hash":     result.PaymentHash,
+		"status":           result.Status,
+	}
+}
+
+func rebalanceAuditReason(result executor.RebalanceResult) string {
+	return fmt.Sprintf("payment_hash=%s amount_sat=%d fee_sat=%d fee_ppm=%d status=%s",
+		result.PaymentHash, result.AmountSat, result.FeeSat, result.FeePpm,
+		result.Status)
 }
 
 func (d *Daemon) handleListPending(reqID string) Response {

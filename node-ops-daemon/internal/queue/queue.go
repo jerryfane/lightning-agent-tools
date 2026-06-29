@@ -52,10 +52,19 @@ func (q *Queue) Enqueue(item Item) {
 // Approve marks the item as approved. Returns the item and true on success,
 // or nil and false if not found or already decided.
 func (q *Queue) Approve(requestID string) (*Item, bool) {
+	return q.ApproveAction(requestID, "")
+}
+
+// ApproveAction marks the item as approved only when it matches action. When
+// action is empty, any pending action may be approved.
+func (q *Queue) ApproveAction(requestID, action string) (*Item, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	item, ok := q.items[requestID]
 	if !ok || item.Status != StatusPending {
+		return nil, false
+	}
+	if action != "" && item.Action != action {
 		return nil, false
 	}
 	item.Status = StatusApproved
@@ -65,10 +74,19 @@ func (q *Queue) Approve(requestID string) (*Item, bool) {
 // Reject marks the item as rejected with the given reason. Returns the item
 // and true on success, or nil and false if not found or already decided.
 func (q *Queue) Reject(requestID, reason string) (*Item, bool) {
+	return q.RejectAction(requestID, "", reason)
+}
+
+// RejectAction marks the item as rejected only when it matches action. When
+// action is empty, any pending action may be rejected.
+func (q *Queue) RejectAction(requestID, action, reason string) (*Item, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	item, ok := q.items[requestID]
 	if !ok || item.Status != StatusPending {
+		return nil, false
+	}
+	if action != "" && item.Action != action {
 		return nil, false
 	}
 	item.Status = StatusRejected

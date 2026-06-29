@@ -97,14 +97,17 @@ func installTestOperatorToken(t *testing.T, cfg *config.Config, dir string) {
 }
 
 type fakeExecutor struct {
-	mu         sync.Mutex
-	current    map[uint64]executor.FeePolicy
-	health     executor.NodeHealthSnapshot
-	healthErr  error
-	executed   []executor.FeeSetRequest
-	onCurrent  func()
-	onExecute  func()
-	executeErr error
+	mu           sync.Mutex
+	current      map[uint64]executor.FeePolicy
+	health       executor.NodeHealthSnapshot
+	healthErr    error
+	executed     []executor.FeeSetRequest
+	rebalanced   []executor.RebalanceRequest
+	onCurrent    func()
+	onExecute    func()
+	onRebalance  func()
+	executeErr   error
+	rebalanceErr error
 }
 
 func newFakeExecutor(current map[uint64]executor.FeePolicy) *fakeExecutor {
@@ -144,6 +147,27 @@ func (f *fakeExecutor) ExecuteFeeSet(_ context.Context,
 	return nil
 }
 
+func (f *fakeExecutor) ExecuteRebalance(_ context.Context,
+	req executor.RebalanceRequest) (executor.RebalanceResult, error) {
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.rebalanceErr != nil {
+		return executor.RebalanceResult{}, f.rebalanceErr
+	}
+	if f.onRebalance != nil {
+		f.onRebalance()
+	}
+	f.rebalanced = append(f.rebalanced, req)
+	return executor.RebalanceResult{
+		PaymentHash: "rebalance-hash",
+		AmountSat:   req.AmountSat,
+		FeeSat:      2,
+		FeePpm:      100,
+		Status:      "succeeded",
+	}, nil
+}
+
 func (f *fakeExecutor) NodeHealth(_ context.Context) (executor.NodeHealthSnapshot, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -165,6 +189,17 @@ func approvePendingFeeSet(t *testing.T, d *Daemon, pending Response) Response {
 	}
 	return d.dispatchOperator(operatorRequest(
 		"approve_fee_set",
+		mustJSON(t, `{"request_id":"`+pending.RequestID+`"}`),
+	))
+}
+
+func approvePendingRebalance(t *testing.T, d *Daemon, pending Response) Response {
+	t.Helper()
+	if pending.Status != "pending" || pending.RequestID == "" {
+		t.Fatalf("expected pending rebalance response, got %+v", pending)
+	}
+	return d.dispatchOperator(operatorRequest(
+		"approve_rebalance",
 		mustJSON(t, `{"request_id":"`+pending.RequestID+`"}`),
 	))
 }
@@ -861,6 +896,258 @@ func TestDispatchRechecksKillSwitchBeforeFallbackQueueing(t *testing.T) {
 	}
 }
 
+func TestDispatchRebalanceApprovalExecutesAndLogs(t *testing.T) {
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{})
+	d := newTestDaemonWithExecutor(t, nil, fake)
+
+	pending := d.dispatch(Request{
+		Action: "execute_rebalance",
+		Params: mustJSON(t, `{"outgoing_chan_id":1,"incoming_chan_id":2,"amount_sat":200,"max_fee_ppm":100}`),
+	})
+	if pending.Status != "pending" {
+		t.Fatalf("expected pending rebalance, got %+v", pending)
+	}
+
+	approved := approvePendingRebalance(t, d, pending)
+	if approved.Status != "ok" {
+		t.Fatalf("expected approved rebalance ok, got %+v", approved)
+	}
+	if len(fake.rebalanced) != 1 {
+		t.Fatalf("expected one rebalance execution, got %+v", fake.rebalanced)
+	}
+	got := fake.rebalanced[0]
+	if got.OutgoingChanID != 1 || got.IncomingChanID != 2 ||
+		got.AmountSat != 200 || got.MaxFeePpm != 100 {
+
+		t.Fatalf("unexpected rebalance request: %+v", got)
+	}
+
+	entries, err := d.ledger.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	wantStatuses := []struct {
+		action string
+		status string
+	}{
+		{"execute_rebalance", "pending"},
+		{"approve_rebalance", "approved"},
+		{"execute_rebalance", "accepted"},
+		{"execute_rebalance", "executed"},
+	}
+	if len(entries) != len(wantStatuses) {
+		t.Fatalf("expected %d ledger entries, got %+v",
+			len(wantStatuses), entries)
+	}
+	for i, want := range wantStatuses {
+		if entries[i].Action != want.action || entries[i].Status != want.status {
+			t.Fatalf("entry %d = %+v, want %s/%s",
+				i, entries[i], want.action, want.status)
+		}
+	}
+}
+
+func TestDispatchRebalanceRejectsOverBudgetBeforeQueueing(t *testing.T) {
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{})
+	d := newTestDaemonWithExecutor(t, func(cfg *config.Config) {
+		cfg.Limits.DailyRebalanceBudgetSat = 100
+	}, fake)
+
+	resp := d.dispatch(Request{
+		Action: "execute_rebalance",
+		Params: mustJSON(t, `{"outgoing_chan_id":1,"incoming_chan_id":2,"amount_sat":101,"max_fee_ppm":100}`),
+	})
+	if resp.Status != "error" ||
+		!strings.Contains(resp.Reason, "daily_rebalance_budget_sat") {
+
+		t.Fatalf("expected daily rebalance budget rejection, got %+v", resp)
+	}
+	if pending := d.queue.ListPending(); len(pending) != 0 {
+		t.Fatalf("over-budget rebalance was queued: %+v", pending)
+	}
+	if len(fake.rebalanced) != 0 {
+		t.Fatalf("over-budget rebalance executed: %+v", fake.rebalanced)
+	}
+}
+
+func TestDispatchRebalanceCooldownCoversBothChannels(t *testing.T) {
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{})
+	d := newTestDaemonWithExecutor(t, func(cfg *config.Config) {
+		cfg.Limits.PerChannelCooldown = "1h"
+	}, fake)
+
+	first := d.dispatch(Request{
+		Action: "execute_rebalance",
+		Params: mustJSON(t, `{"outgoing_chan_id":1,"incoming_chan_id":2,"amount_sat":100,"max_fee_ppm":100}`),
+	})
+	if first.Status != "pending" {
+		t.Fatalf("expected first rebalance to queue, got %+v", first)
+	}
+	if approved := approvePendingRebalance(t, d, first); approved.Status != "ok" {
+		t.Fatalf("expected first rebalance approval ok, got %+v", approved)
+	}
+
+	second := d.dispatch(Request{
+		Action: "execute_rebalance",
+		Params: mustJSON(t, `{"outgoing_chan_id":3,"incoming_chan_id":2,"amount_sat":100,"max_fee_ppm":100}`),
+	})
+	if second.Status != "error" || !strings.Contains(second.Reason, "cooldown") {
+		t.Fatalf("expected incoming-channel cooldown rejection, got %+v", second)
+	}
+}
+
+func TestDispatchRebalanceDailyBudgetSurvivesRestart(t *testing.T) {
+	storeDir := filepath.Join(t.TempDir(), "node-ops")
+	if err := os.Mkdir(storeDir, 0700); err != nil {
+		t.Fatalf("Mkdir store dir: %v", err)
+	}
+	cfg := &config.Config{
+		Limits: config.Limits{
+			DailyRebalanceBudgetSat: 250,
+			DailyFeePpmBudget:       500,
+			MaxFeePpmDelta:          100,
+			PerChannelCooldown:      "0s",
+			RebalanceMaxFeePpm:      500,
+		},
+		Approval: config.Approval{RequireApproval: true},
+		Storage: config.Storage{
+			LedgerPath:      filepath.Join(storeDir, "ledger.db"),
+			LimitsStatePath: filepath.Join(storeDir, "limits-state.json"),
+			KillswitchFile:  filepath.Join(storeDir, "STOP"),
+		},
+	}
+	installTestOperatorToken(t, cfg, storeDir)
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{})
+
+	firstDaemon, err := New(cfg, fake)
+	if err != nil {
+		t.Fatalf("New first daemon: %v", err)
+	}
+	first := firstDaemon.dispatch(Request{
+		Action: "execute_rebalance",
+		Params: mustJSON(t, `{"outgoing_chan_id":1,"incoming_chan_id":2,"amount_sat":200,"max_fee_ppm":100}`),
+	})
+	if first.Status != "pending" {
+		t.Fatalf("expected first rebalance pending, got %+v", first)
+	}
+	if approved := approvePendingRebalance(t, firstDaemon, first); approved.Status != "ok" {
+		t.Fatalf("expected first rebalance approval ok, got %+v", approved)
+	}
+	if err := firstDaemon.Close(); err != nil {
+		t.Fatalf("Close first daemon: %v", err)
+	}
+
+	restarted, err := New(cfg, fake)
+	if err != nil {
+		t.Fatalf("New restarted daemon: %v", err)
+	}
+	t.Cleanup(func() { _ = restarted.Close() })
+	second := restarted.dispatch(Request{
+		Action: "execute_rebalance",
+		Params: mustJSON(t, `{"outgoing_chan_id":3,"incoming_chan_id":4,"amount_sat":51,"max_fee_ppm":100}`),
+	})
+	if second.Status != "error" ||
+		!strings.Contains(second.Reason, "daily_rebalance_budget_sat") {
+
+		t.Fatalf("expected persisted budget rejection, got %+v", second)
+	}
+}
+
+func TestDispatchRebalanceExecutorFailureRollsBackLimits(t *testing.T) {
+	storeDir := filepath.Join(t.TempDir(), "node-ops")
+	if err := os.Mkdir(storeDir, 0700); err != nil {
+		t.Fatalf("Mkdir store dir: %v", err)
+	}
+	cfg := &config.Config{
+		Limits: config.Limits{
+			DailyRebalanceBudgetSat: 250,
+			DailyFeePpmBudget:       500,
+			MaxFeePpmDelta:          100,
+			PerChannelCooldown:      "1h",
+			RebalanceMaxFeePpm:      500,
+		},
+		Approval: config.Approval{RequireApproval: true},
+		Storage: config.Storage{
+			LedgerPath:      filepath.Join(storeDir, "ledger.db"),
+			LimitsStatePath: filepath.Join(storeDir, "limits-state.json"),
+			KillswitchFile:  filepath.Join(storeDir, "STOP"),
+		},
+	}
+	installTestOperatorToken(t, cfg, storeDir)
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{})
+	fake.rebalanceErr = errors.New("route failed")
+
+	firstDaemon, err := New(cfg, fake)
+	if err != nil {
+		t.Fatalf("New first daemon: %v", err)
+	}
+	failed := firstDaemon.dispatch(Request{
+		Action: "execute_rebalance",
+		Params: mustJSON(t, `{"outgoing_chan_id":1,"incoming_chan_id":2,"amount_sat":200,"max_fee_ppm":100}`),
+	})
+	if failed.Status != "pending" {
+		t.Fatalf("expected first rebalance pending, got %+v", failed)
+	}
+	failedApproval := approvePendingRebalance(t, firstDaemon, failed)
+	if failedApproval.Status != "error" ||
+		!strings.Contains(failedApproval.Reason, "route failed") {
+
+		t.Fatalf("expected executor failure, got %+v", failedApproval)
+	}
+	if err := firstDaemon.Close(); err != nil {
+		t.Fatalf("Close first daemon: %v", err)
+	}
+
+	fake.rebalanceErr = nil
+	restarted, err := New(cfg, fake)
+	if err != nil {
+		t.Fatalf("New restarted daemon: %v", err)
+	}
+	t.Cleanup(func() { _ = restarted.Close() })
+	second := restarted.dispatch(Request{
+		Action: "execute_rebalance",
+		Params: mustJSON(t, `{"outgoing_chan_id":1,"incoming_chan_id":2,"amount_sat":200,"max_fee_ppm":100}`),
+	})
+	if second.Status != "pending" {
+		t.Fatalf("failed execution should not persist cooldown/budget, got %+v",
+			second)
+	}
+	if approved := approvePendingRebalance(t, restarted, second); approved.Status != "ok" {
+		t.Fatalf("retry approval should succeed, got %+v", approved)
+	}
+	if len(fake.rebalanced) != 1 {
+		t.Fatalf("expected one successful rebalance, got %+v", fake.rebalanced)
+	}
+}
+
+func TestOperatorFeeSetApprovalCannotApproveRebalance(t *testing.T) {
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{})
+	d := newTestDaemonWithExecutor(t, nil, fake)
+
+	pending := d.dispatch(Request{
+		Action: "execute_rebalance",
+		Params: mustJSON(t, `{"outgoing_chan_id":1,"incoming_chan_id":2,"amount_sat":100,"max_fee_ppm":100}`),
+	})
+	if pending.Status != "pending" {
+		t.Fatalf("expected pending rebalance, got %+v", pending)
+	}
+	wrongApproval := d.dispatchOperator(operatorRequest(
+		"approve_fee_set",
+		mustJSON(t, `{"request_id":"`+pending.RequestID+`"}`),
+	))
+	if wrongApproval.Status != "error" {
+		t.Fatalf("fee-set approval should not approve rebalance, got %+v",
+			wrongApproval)
+	}
+	if pendingItems := d.queue.ListPending(); len(pendingItems) != 1 {
+		t.Fatalf("rebalance should remain pending after wrong approval: %+v",
+			pendingItems)
+	}
+	if len(fake.rebalanced) != 0 {
+		t.Fatalf("wrong approval executed rebalance: %+v", fake.rebalanced)
+	}
+}
+
 func TestRunRefusesActiveSocket(t *testing.T) {
 	d := newTestDaemon(t, nil)
 	sockPath := filepath.Join(t.TempDir(), "daemon.sock")
@@ -913,6 +1200,48 @@ func TestRunWithOperatorSocketApprovesPendingFeeSet(t *testing.T) {
 	}
 	if len(fake.executed) != 1 {
 		t.Fatalf("expected socket-approved execution, got %+v", fake.executed)
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("RunWithOperator: %v", err)
+	}
+}
+
+func TestRunWithOperatorSocketApprovesPendingRebalance(t *testing.T) {
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{})
+	d := newTestDaemonWithExecutor(t, nil, fake)
+	dir := t.TempDir()
+	execSock := filepath.Join(dir, "daemon.sock")
+	operatorSock := filepath.Join(dir, "operator.sock")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- d.RunWithOperator(ctx, execSock, operatorSock)
+	}()
+	waitForSocket(t, execSock)
+	waitForSocket(t, operatorSock)
+
+	pending := socketRoundTrip(t, execSock, Request{
+		Action: "execute_rebalance",
+		Params: mustJSON(t, `{"outgoing_chan_id":42,"incoming_chan_id":43,"amount_sat":100,"max_fee_ppm":100}`),
+	})
+	if pending.Status != "pending" {
+		t.Fatalf("expected pending response, got %+v", pending)
+	}
+
+	approved := socketRoundTrip(t, operatorSock, Request{
+		Action:        "approve_rebalance",
+		Params:        mustJSON(t, `{"request_id":"`+pending.RequestID+`"}`),
+		OperatorToken: testOperatorToken,
+	})
+	if approved.Status != "ok" {
+		t.Fatalf("expected operator approval ok, got %+v", approved)
+	}
+	if len(fake.rebalanced) != 1 {
+		t.Fatalf("expected socket-approved rebalance, got %+v", fake.rebalanced)
 	}
 
 	cancel()

@@ -38,6 +38,7 @@ func TestManager_Creation(t *testing.T) {
 	assert.NotNil(t, manager.connectionService)
 	assert.NotNil(t, manager.nodeOpsAuditService)
 	assert.NotNil(t, manager.nodeOpsFeeSetService)
+	assert.NotNil(t, manager.nodeOpsRebalanceService)
 }
 
 // Test RegisterTools with valid MCP server.
@@ -63,6 +64,7 @@ func TestManager_RegisterTools(t *testing.T) {
 	assert.Contains(t, names, "lnc_list_unspent")
 	assert.Contains(t, names, "lnc_query_node_ops_audit")
 	assert.Contains(t, names, "lnc_execute_fee_set")
+	assert.Contains(t, names, "lnc_execute_rebalance")
 	assert.NotZero(t, len(stub.tools))
 }
 
@@ -101,6 +103,7 @@ func TestManager_RegisterTools_GatedMode(t *testing.T) {
 	assert.Contains(t, names, "lnc_list_peers")
 	assert.Contains(t, names, "lnc_query_node_ops_audit")
 	assert.Contains(t, names, "lnc_execute_fee_set")
+	assert.Contains(t, names, "lnc_execute_rebalance")
 	assert.Len(t, stub.tools, len(names))
 }
 
@@ -186,6 +189,7 @@ func TestManager_ServiceIntegration(t *testing.T) {
 	assert.NotNil(t, manager.nodeService)
 	assert.NotNil(t, manager.nodeOpsAuditService)
 	assert.NotNil(t, manager.nodeOpsFeeSetService)
+	assert.NotNil(t, manager.nodeOpsRebalanceService)
 
 	// Test that representative tools can be created.
 	decodeInvoiceTool := manager.invoiceService.DecodeInvoiceTool()

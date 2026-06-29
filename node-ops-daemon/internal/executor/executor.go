@@ -25,6 +25,23 @@ type FeeSetRequest struct {
 	FeePpm   int64
 }
 
+// RebalanceRequest describes a daemon-approved circular rebalance attempt.
+type RebalanceRequest struct {
+	OutgoingChanID uint64
+	IncomingChanID uint64
+	AmountSat      int64
+	MaxFeePpm      int64
+}
+
+// RebalanceResult describes the successful route-send attempt.
+type RebalanceResult struct {
+	PaymentHash string
+	AmountSat   int64
+	FeeSat      int64
+	FeePpm      int64
+	Status      string
+}
+
 // FeePolicy is the daemon-owned current forwarding fee policy for a channel.
 type FeePolicy struct {
 	BaseMsat      int64
@@ -70,6 +87,10 @@ type NodeExecutor interface {
 	// Returns an error if the RPC fails or the node rejects the update.
 	ExecuteFeeSet(ctx context.Context, req FeeSetRequest) error
 
+	// ExecuteRebalance executes a bounded circular rebalance.
+	// Returns an error if route construction or payment execution fails.
+	ExecuteRebalance(ctx context.Context, req RebalanceRequest) (RebalanceResult, error)
+
 	// NodeHealth returns a read-only health snapshot for background alerting.
 	NodeHealth(ctx context.Context) (NodeHealthSnapshot, error)
 }
@@ -86,6 +107,13 @@ func (s *StubExecutor) CurrentFeePolicy(_ context.Context, _ uint64) (FeePolicy,
 // ExecuteFeeSet fails until issue #9 wires real RPCs.
 func (s *StubExecutor) ExecuteFeeSet(_ context.Context, _ FeeSetRequest) error {
 	return ErrNotImplemented
+}
+
+// ExecuteRebalance fails until concrete RPCs are configured.
+func (s *StubExecutor) ExecuteRebalance(_ context.Context,
+	_ RebalanceRequest) (RebalanceResult, error) {
+
+	return RebalanceResult{}, ErrNotImplemented
 }
 
 // NodeHealth fails until a concrete read-only health source is configured.
