@@ -34,6 +34,11 @@ max_fee_ppm_delta = 42
 		cfg.Storage.KillswitchFile == "" {
 		t.Fatalf("partial config should preserve storage defaults: %+v", cfg.Storage)
 	}
+	if cfg.Monitor.Enabled || cfg.Monitor.PollInterval == "" ||
+		cfg.Monitor.AlertCooldown == "" || cfg.Monitor.AlertPath == "" {
+
+		t.Fatalf("partial config should preserve monitor defaults: %+v", cfg.Monitor)
+	}
 }
 
 func TestLoadExpandsStoragePaths(t *testing.T) {
@@ -68,6 +73,31 @@ killswitch = "~/.node-ops/CUSTOM_STOP"
 	}
 }
 
+func TestLoadExpandsMonitorAlertPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	err := os.WriteFile(path, []byte(`
+[monitor]
+alert_path = "~/.node-ops/custom-alerts.jsonl"
+`), 0600)
+	if err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir: %v", err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	want := filepath.Join(home, ".node-ops", "custom-alerts.jsonl")
+	if cfg.Monitor.AlertPath != want {
+		t.Fatalf("alert path = %q, want %q", cfg.Monitor.AlertPath, want)
+	}
+}
+
 func TestLoadRejectsEmptyStoragePaths(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -97,6 +127,68 @@ func TestLoadRejectsEmptyStoragePaths(t *testing.T) {
 	killswitch = " "
 	`,
 			wantErr: "storage.killswitch",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(tc.body), 0600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+
+			_, err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected %q error, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidMonitorConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{
+			name: "bad poll interval",
+			body: `
+[monitor]
+poll_interval = "nope"
+`,
+			wantErr: "monitor.poll_interval",
+		},
+		{
+			name: "zero poll interval",
+			body: `
+[monitor]
+poll_interval = "0s"
+`,
+			wantErr: "must be positive",
+		},
+		{
+			name: "negative cooldown",
+			body: `
+[monitor]
+alert_cooldown = "-1s"
+`,
+			wantErr: "monitor.alert_cooldown",
+		},
+		{
+			name: "unknown channel",
+			body: `
+[monitor]
+alert_channel = "webhook"
+`,
+			wantErr: "monitor.alert_channel",
+		},
+		{
+			name: "empty file path",
+			body: `
+[monitor]
+alert_channel = "file"
+alert_path = ""
+`,
+			wantErr: "monitor.alert_path",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
