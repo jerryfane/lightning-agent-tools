@@ -1,0 +1,4 @@
+interface:
+  display_name: "Node Ops"
+  short_description: "Operate gated Lightning node actions"
+  default_prompt: "Use $node-ops to inspect pending node operations and prepare a safe approve-or-deny recommendation."
