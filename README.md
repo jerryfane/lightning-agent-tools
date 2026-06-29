@@ -49,6 +49,15 @@ skills/lightning-mcp-server/scripts/setup-claude-config.sh --scope project
 See [Quick Start](#quick-start) below for detailed setup options including
 environment variables, regtest mode, and the full commerce stack.
 
+## Docs Site
+
+The published documentation site is:
+
+- Human docs: <https://jerryfane.github.io/lightning-agent-tools/>
+- LLM index: <https://jerryfane.github.io/lightning-agent-tools/llms.txt>
+- Full LLM bundle: <https://jerryfane.github.io/lightning-agent-tools/llms-full.txt>
+- Coding-agent instructions: [AGENTS.md](AGENTS.md)
+
 ## How It Works
 
 ```mermaid
@@ -315,12 +324,26 @@ production checklist.
 
 ## Documentation
 
+Use the published docs site for navigable pages and generated skill references:
+
+| Resource | Description |
+|----------|-------------|
+| [Docs site](https://jerryfane.github.io/lightning-agent-tools/) | Published Docusaurus site for human readers |
+| [LLM index](https://jerryfane.github.io/lightning-agent-tools/llms.txt) | Concise generated index for agents and language models |
+| [Full LLM bundle](https://jerryfane.github.io/lightning-agent-tools/llms-full.txt) | Single generated Markdown bundle of the docs |
+| [Skill Reference](https://jerryfane.github.io/lightning-agent-tools/generated/skills) | Generated pages from every `skills/*/SKILL.md` file |
+| [Agent Instructions](AGENTS.md) | Repo-local coding-agent guidance |
+
+Canonical source docs live in this repository:
+
 | Document | Description |
 |----------|-------------|
+| [Getting Started](docs/getting-started.md) | First-run install, regtest, and node-ops path |
 | [Architecture](docs/architecture.md) | System design, component map, plugin discovery, data flows |
 | [Security](docs/security.md) | Three-tier security model, remote signer, macaroon scoping, production checklist |
 | [L402 and lnget](docs/l402-and-lnget.md) | The L402 protocol, lnget usage, spending controls, token caching |
 | [MCP Server](docs/mcp-server.md) | LNC mechanics, setup walkthrough, tool reference, configuration |
+| [Node-Ops Operations](docs/node-ops-operations.md) | Daemon lifecycle, proposal flow, approvals, audit, alerts, and troubleshooting |
 | [Node-Ops Regtest E2E](docs/node-ops-regtest-e2e.md) | Fresh regtest setup for scoped macaroon, daemon, gated fee-set, gated rebalance, and audit proof |
 | [Commerce](docs/commerce.md) | Buyer and seller agent setup, the commerce loop, cost management |
 | [Two-Agent Setup](docs/two-agent-setup.md) | Signer agent + node agent walkthrough for production key isolation |

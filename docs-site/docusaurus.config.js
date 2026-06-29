@@ -69,7 +69,13 @@ const config = {
         generateLLMsFullTxt: true,
         generateMarkdownFiles: true,
         includeBlog: false,
-        includeOrder: ['intro.md', 'generated/quickref.md', 'generated/**/*.md'],
+        includeOrder: [
+          'intro.md',
+          'agent-and-llm-docs.md',
+          'generated/getting-started.md',
+          'generated/quickref.md',
+          'generated/**/*.md',
+        ],
         rootContent:
           'Use these links for an AI-friendly index of the Lightning Agent Tools documentation.',
         fullRootContent:
