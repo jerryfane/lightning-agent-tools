@@ -7,8 +7,14 @@ sidebar_position: 2
 # Agent and LLM Docs
 
 Lightning Agent Tools exposes three agent-facing documentation surfaces:
-`AGENTS.md`, `/llms.txt`, and `/llms-full.txt`. They serve different readers and
-should not be edited as substitutes for one another.
+`AGENTS.md`, `/llms.txt`, and `/llms-full.txt`. On GitHub Pages they are
+available at:
+
+- [llms.txt](https://jerryfane.github.io/lightning-agent-tools/llms.txt)
+- [llms-full.txt](https://jerryfane.github.io/lightning-agent-tools/llms-full.txt)
+
+They serve different readers and should not be edited as substitutes for one
+another.
 
 ## `AGENTS.md`
 
@@ -66,7 +72,3 @@ The LLM files are generated from canonical Docusaurus docs during `npm run
 build` in `docs-site/`. Do not manually edit generated `llms.txt`,
 `llms-full.txt`, Markdown mirrors, or build output. Update the source docs, run
 the docs build, and let the generator produce the LLM-facing files.
-
-Until final integration verifies the published GitHub Pages deployment, refer to
-these files by their build paths (`/llms.txt` and `/llms-full.txt`) rather than a
-published Pages URL.
