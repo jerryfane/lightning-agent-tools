@@ -157,14 +157,52 @@ func TestPollRetriesAfterPublishFailure(t *testing.T) {
 	}
 }
 
+func TestRunRecordsLastPublishError(t *testing.T) {
+	pub := &capturePublisher{err: errors.New("disk full")}
+	mon, err := New(&fakeHealthReader{
+		snapshot: forceCloseSnapshot(),
+	}, pub, Config{
+		PollInterval:  10 * time.Millisecond,
+		AlertCooldown: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		mon.Run(ctx)
+	}()
+
+	deadline := time.After(time.Second)
+	for {
+		msg, _, ok := mon.LastError()
+		if ok && strings.Contains(msg, "disk full") {
+			cancel()
+			<-done
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for monitor error")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 func TestPollPublishesHealthPollFailureAlert(t *testing.T) {
 	pub := &capturePublisher{}
 	mon := newTestMonitor(t, &fakeHealthReader{
 		err: errors.New("lnd unavailable"),
 	}, pub)
 
-	if err := mon.Poll(context.Background()); err != nil {
-		t.Fatalf("Poll: %v", err)
+	if err := mon.Poll(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "lnd unavailable") {
+
+		t.Fatalf("expected health read error, got %v", err)
 	}
 	if len(pub.events) != 1 {
 		t.Fatalf("expected poll failure alert, got %d", len(pub.events))
@@ -177,6 +215,60 @@ func TestPollPublishesHealthPollFailureAlert(t *testing.T) {
 	}
 	if event.Details["error"] != "lnd unavailable" {
 		t.Fatalf("expected poll error detail, got %+v", event.Details)
+	}
+}
+
+func TestPollSynthesizesDistinctIDsForIDLessAlerts(t *testing.T) {
+	pub := &capturePublisher{}
+	mon := newTestMonitor(t, &fakeHealthReader{
+		snapshot: executor.NodeHealthSnapshot{
+			OverallStatus: "critical",
+			Alerts: []executor.HealthAlert{
+				{
+					Severity: "critical",
+					Category: "channel",
+					Message:  "Force-closing channel detected",
+					Details: map[string]interface{}{
+						"channel_point":   "txid:0",
+						"remote_node_pub": "remote-a",
+						"closing_txid":    "close-a",
+					},
+				},
+				{
+					Severity: "critical",
+					Category: "channel",
+					Message:  "Force-closing channel detected",
+					Details: map[string]interface{}{
+						"channel_point":   "txid:1",
+						"remote_node_pub": "remote-b",
+						"closing_txid":    "close-b",
+					},
+				},
+			},
+		},
+	}, pub)
+	now := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
+	mon.SetClock(func() time.Time { return now })
+
+	if err := mon.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if len(pub.events) != 2 {
+		t.Fatalf("expected two distinct alerts, got %d", len(pub.events))
+	}
+	if pub.events[0].ID == "" || pub.events[1].ID == "" ||
+		pub.events[0].ID == pub.events[1].ID {
+
+		t.Fatalf("expected distinct synthesized IDs, got %q and %q",
+			pub.events[0].ID, pub.events[1].ID)
+	}
+
+	if err := mon.Poll(context.Background()); err != nil {
+		t.Fatalf("second Poll: %v", err)
+	}
+	if len(pub.events) != 2 {
+		t.Fatalf("duplicates inside cooldown should be suppressed, got %d events",
+			len(pub.events))
 	}
 }
 
@@ -271,5 +363,36 @@ func TestJSONLPublisherRejectsUnwritablePrivateDirectory(t *testing.T) {
 	_, err := NewJSONLPublisher(filepath.Join(dir, "alerts.jsonl"))
 	if err == nil || !strings.Contains(err.Error(), "owner-writable") {
 		t.Fatalf("expected unwritable directory rejection, got %v", err)
+	}
+}
+
+func TestJSONLPublisherRejectsSymlinkReplacement(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "alerts")
+	path := filepath.Join(dir, "alerts.jsonl")
+	pub, err := NewJSONLPublisher(path)
+	if err != nil {
+		t.Fatalf("NewJSONLPublisher: %v", err)
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("Remove alert file: %v", err)
+	}
+	target := filepath.Join(t.TempDir(), "target.jsonl")
+	if err := os.Symlink(target, path); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	err = pub.Publish(context.Background(), AlertEvent{
+		ID:       "channel:force-close",
+		FiredAt:  time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC),
+		Severity: "critical",
+		Category: "channel",
+		Message:  "Force-closing channel detected",
+	})
+	if err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
+		t.Fatalf("expected symlink replacement rejection, got %v", err)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("symlink target should not be created, stat err=%v", err)
 	}
 }

@@ -18,6 +18,7 @@ import (
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/config"
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/executor"
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/ledger"
+	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/monitor"
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/queue"
 )
 
@@ -235,6 +236,58 @@ func TestNewRejectsEnabledMonitorWithStubExecutor(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "concrete node_health reader") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+type failingAlertPublisher struct{}
+
+func (f failingAlertPublisher) Publish(context.Context, monitor.AlertEvent) error {
+	return errors.New("alert sink down")
+}
+
+func TestStatusReportsMonitorLastError(t *testing.T) {
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{})
+	fake.health = forceCloseHealthSnapshot()
+	mon, err := monitor.New(fake, failingAlertPublisher{}, monitor.Config{
+		PollInterval:  10 * time.Millisecond,
+		AlertCooldown: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("monitor New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		mon.Run(ctx)
+	}()
+
+	deadline := time.After(time.Second)
+	for {
+		if msg, _, ok := mon.LastError(); ok &&
+			strings.Contains(msg, "alert sink down") {
+
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for monitor error")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+
+	cfg := config.Defaults()
+	cfg.Storage.KillswitchFile = filepath.Join(t.TempDir(), "STOP")
+	status := (&Daemon{cfg: cfg, monitor: mon}).statusResult()
+	if !strings.Contains(status["monitor_error"], "alert sink down") {
+		t.Fatalf("monitor_error = %q", status["monitor_error"])
+	}
+	if status["monitor_error_at"] == "" {
+		t.Fatalf("monitor_error_at was not set: %+v", status)
 	}
 }
 

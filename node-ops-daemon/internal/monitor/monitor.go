@@ -54,9 +54,11 @@ type Monitor struct {
 	publisher Publisher
 	cfg       Config
 
-	mu       sync.Mutex
-	lastSent map[string]time.Time
-	now      func() time.Time
+	mu        sync.Mutex
+	lastSent  map[string]time.Time
+	lastErr   error
+	lastErrAt time.Time
+	now       func() time.Time
 }
 
 // New creates a health monitor.
@@ -89,9 +91,19 @@ func (m *Monitor) SetClock(now func() time.Time) {
 	m.now = now
 }
 
+// LastError returns the most recent polling or publishing error.
+func (m *Monitor) LastError() (string, time.Time, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.lastErr == nil {
+		return "", time.Time{}, false
+	}
+	return m.lastErr.Error(), m.lastErrAt, true
+}
+
 // Run polls immediately and then on the configured interval until ctx is done.
 func (m *Monitor) Run(ctx context.Context) {
-	_ = m.Poll(ctx)
+	m.pollAndRecord(ctx)
 
 	ticker := time.NewTicker(m.cfg.PollInterval)
 	defer ticker.Stop()
@@ -101,16 +113,31 @@ func (m *Monitor) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_ = m.Poll(ctx)
+			m.pollAndRecord(ctx)
 		}
 	}
+}
+
+func (m *Monitor) pollAndRecord(ctx context.Context) {
+	m.recordError(m.Poll(ctx))
+}
+
+func (m *Monitor) recordError(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastErr = err
+	if err != nil {
+		m.lastErrAt = m.now().UTC()
+		return
+	}
+	m.lastErrAt = time.Time{}
 }
 
 // Poll reads node health once and publishes every non-suppressed alert.
 func (m *Monitor) Poll(ctx context.Context) error {
 	snapshot, err := m.reader.NodeHealth(ctx)
 	if err != nil {
-		return m.publish(ctx, AlertEvent{
+		if publishErr := m.publish(ctx, AlertEvent{
 			ID:       "monitor:node_health_poll_failed",
 			FiredAt:  m.currentTime(),
 			Severity: "warning",
@@ -119,7 +146,10 @@ func (m *Monitor) Poll(ctx context.Context) error {
 			Details: map[string]interface{}{
 				"error": err.Error(),
 			},
-		})
+		}); publishErr != nil {
+			return publishErr
+		}
+		return fmt.Errorf("node health poll failed: %w", err)
 	}
 
 	for _, alert := range snapshot.Alerts {
@@ -208,7 +238,8 @@ type JSONLPublisher struct {
 
 // NewJSONLPublisher creates a JSONL alert publisher.
 func NewJSONLPublisher(path string) (*JSONLPublisher, error) {
-	if strings.TrimSpace(path) == "" {
+	path = strings.TrimSpace(path)
+	if path == "" {
 		return nil, fmt.Errorf("alert path must not be empty")
 	}
 	if err := prepareAlertDir(filepath.Dir(path)); err != nil {
@@ -239,6 +270,9 @@ func prepareAlertDir(dir string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("alert path parent %s is not a directory", dir)
 	}
+	if err := checkAlertDirOwner(dir, info); err != nil {
+		return err
+	}
 	if info.Mode().Perm()&0077 == 0 {
 		if info.Mode().Perm()&0300 == 0300 {
 			return nil
@@ -251,27 +285,44 @@ func prepareAlertDir(dir string) error {
 }
 
 func prepareAlertFile(path string) error {
+	f, err := openSecureAlertFile(path)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+func openSecureAlertFile(path string) (*os.File, error) {
 	info, err := os.Lstat(path)
 	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("stat alert file: %w", err)
+		return nil, fmt.Errorf("stat alert file: %w", err)
 	}
 	if err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("alert file %s must not be a symlink", path)
+			return nil, fmt.Errorf("alert file %s must not be a symlink", path)
 		}
 		if !info.Mode().IsRegular() {
-			return fmt.Errorf("alert file %s is not a regular file", path)
+			return nil, fmt.Errorf("alert file %s is not a regular file", path)
 		}
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	f, err := openAlertFileNoFollow(path)
 	if err != nil {
-		return fmt.Errorf("open alert file: %w", err)
+		return nil, fmt.Errorf("open alert file: %w", err)
 	}
-	defer f.Close()
-	if err := os.Chmod(path, 0600); err != nil {
-		return fmt.Errorf("secure alert file: %w", err)
+	fileInfo, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("stat alert file: %w", err)
 	}
-	return nil
+	if !fileInfo.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, fmt.Errorf("alert file %s is not a regular file", path)
+	}
+	if err := f.Chmod(0600); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("secure alert file: %w", err)
+	}
+	return f, nil
 }
 
 // Publish appends event as one JSON object.
@@ -285,14 +336,14 @@ func (p *JSONLPublisher) Publish(ctx context.Context, event AlertEvent) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	f, err := os.OpenFile(p.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err := prepareAlertDir(filepath.Dir(p.path)); err != nil {
+		return err
+	}
+	f, err := openSecureAlertFile(p.path)
 	if err != nil {
-		return fmt.Errorf("open alert file: %w", err)
+		return err
 	}
 	defer f.Close()
-	if err := os.Chmod(p.path, 0600); err != nil {
-		return fmt.Errorf("secure alert file: %w", err)
-	}
 	if err := json.NewEncoder(f).Encode(event); err != nil {
 		return fmt.Errorf("write alert: %w", err)
 	}

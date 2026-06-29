@@ -397,18 +397,22 @@ func (d *Daemon) statusResult() map[string]string {
 	if d.monitor != nil {
 		monitorState = "enabled"
 	}
-	if killswitch.Active(d.cfg.Storage.KillswitchFile) {
-		return map[string]string{
-			"state":      "stopped",
-			"killswitch": "active",
-			"monitor":    monitorState,
-		}
-	}
-	return map[string]string{
+	result := map[string]string{
 		"state":      "running",
 		"killswitch": "inactive",
 		"monitor":    monitorState,
 	}
+	if killswitch.Active(d.cfg.Storage.KillswitchFile) {
+		result["state"] = "stopped"
+		result["killswitch"] = "active"
+	}
+	if d.monitor != nil {
+		if msg, at, ok := d.monitor.LastError(); ok {
+			result["monitor_error"] = msg
+			result["monitor_error_at"] = at.Format(time.RFC3339)
+		}
+	}
+	return result
 }
 
 func (d *Daemon) rejectIfKillSwitchActive(reqID, action string,
