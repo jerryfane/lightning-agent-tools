@@ -13,5 +13,8 @@ node_modules/
 bin/lightning-mcp-server
 !bin/lightning-mcp-server.placeholder
 
+# Python helper script caches
+__pycache__/
+
 # Credentials (never commit)
 *.macaroon

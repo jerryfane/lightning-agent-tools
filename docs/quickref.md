@@ -159,6 +159,55 @@ skills/lightning-mcp-server/scripts/setup-claude-config.sh --scope project   # a
 skills/lightning-mcp-server/scripts/setup-claude-config.sh --scope global    # add to ~/.claude.json
 ```
 
+## Node Ops
+
+These daemon commands require a source checkout because the published package
+does not ship the `node-ops-daemon` source tree. See the full E2E runbook for a
+fresh Docker regtest setup.
+
+```bash
+cd node-ops-daemon && make build && cd ..                                  # build governance daemon
+mkdir -p ~/.node-ops && chmod 700 ~/.node-ops
+cp node-ops-daemon/config.example.toml ~/.node-ops/config.toml
+skills/macaroon-bakery/scripts/bake.sh --container litd --network regtest --role node-ops --save-to ~/.node-ops/node-ops.macaroon
+docker cp litd:/root/.lnd/tls.cert ~/.node-ops/tls.cert
+chmod 600 ~/.node-ops/node-ops.macaroon ~/.node-ops/tls.cert
+python3 - <<'PY'                                                            # regtest credential paths
+from pathlib import Path
+path = Path.home() / ".node-ops" / "config.toml"
+body = path.read_text()
+body = body.replace('macaroon = "~/.node-ops/node-ops.macaroon"',
+                    f'macaroon = "{Path.home()}/.node-ops/node-ops.macaroon"')
+body = body.replace('tls_cert = "~/.lnd/tls.cert"',
+                    f'tls_cert = "{Path.home()}/.node-ops/tls.cert"')
+body = body.replace('approval_token_file = "~/.node-ops/operator.token"',
+                    f'approval_token_file = "{Path.home()}/.node-ops/operator.token"')
+path.write_text(body)
+PY
+python3 - <<'PY'                                                            # operator token
+import secrets
+from pathlib import Path
+path = Path.home() / ".node-ops" / "operator.token"
+path.write_text(secrets.token_urlsafe(32) + "\n")
+path.chmod(0o600)
+PY
+node-ops-daemon/node-ops-daemon ~/.node-ops/config.toml                     # run daemon
+
+skills/node-ops/scripts/observe.py status                                  # daemon + kill-switch state
+skills/node-ops/scripts/observe.py pending                                 # queued approvals
+skills/node-ops/scripts/observe.py audit --limit 20                        # append-only audit entries
+
+skills/node-ops/scripts/propose.py fee-set --chan-id 123 --base-msat 1000 --fee-ppm 100
+skills/node-ops/scripts/execute.py fee-set --chan-id 123 --base-msat 1000 --fee-ppm 100
+skills/node-ops/scripts/execute.py approve-fee-set --request-id <id>       # operator token required
+
+skills/node-ops/scripts/propose.py rebalance --outgoing-chan-id 11 --incoming-chan-id 22 --amount-sat 50000 --max-fee-ppm 500
+skills/node-ops/scripts/execute.py rebalance --outgoing-chan-id 11 --incoming-chan-id 22 --amount-sat 50000 --max-fee-ppm 500
+skills/node-ops/scripts/execute.py approve-rebalance --request-id <id>     # operator token required
+```
+
+Full disposable proof: [Node-Ops Regtest E2E](node-ops-regtest-e2e.md).
+
 ## Remote Signer
 
 ```bash

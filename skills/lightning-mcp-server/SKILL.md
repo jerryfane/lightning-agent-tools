@@ -1,6 +1,6 @@
 ---
 name: lightning-mcp-server
-description: Build and configure the MCP server for Lightning Node Connect (LNC). Connects AI assistants to lnd nodes via encrypted WebSocket tunnels using pairing phrases — no direct network access or TLS certs needed. Read-only by default (18 tools for querying node state, channels, payments, invoices, peers, on-chain data).
+description: Build and configure the MCP server for Lightning Node Connect (LNC). Connects AI assistants to lnd nodes via encrypted WebSocket tunnels using pairing phrases — no direct network access or TLS certs needed. Provides read-only LNC tools plus daemon-gated node-ops request tools that never receive LND write credentials.
 ---
 
 # MCP LNC Server
@@ -11,8 +11,11 @@ through a mailbox relay, so the agent never needs direct gRPC access, TLS
 certificates, or macaroons — just a 10-word pairing phrase from Lightning
 Terminal.
 
-The MCP server is **read-only by default** — it exposes 18 tools for querying
-node state but cannot send payments or modify channels.
+The MCP server is **read-only by default** for LNC-backed node access. It can
+query node state, channels, payments, invoices, peers, and on-chain data, and it
+can submit bounded node-ops requests to `node-ops-daemon`. It cannot send
+payments or modify channels directly; fee-set and rebalance execution require
+daemon limits plus separate operator approval.
 
 ## Quick Start
 
@@ -40,7 +43,8 @@ Claude Code  <--stdio-->  lightning-mcp-server  <--LNC WebSocket-->  Mailbox  <-
 2. Agent calls `lnc_connect` with a pairing phrase and password
 3. Server generates an ephemeral ECDSA keypair and opens an encrypted WebSocket
    tunnel through the mailbox relay
-4. Once connected, the agent can call any of the 18 read-only tools
+4. Once connected, the agent can call read-only LNC tools and daemon-gated
+   node-ops request tools
 5. `lnc_disconnect` closes the tunnel
 
 No keys, certs, or macaroons are stored on disk — the pairing phrase is the
@@ -175,7 +179,7 @@ Or run via Docker:
 }
 ```
 
-## Available Tools (18)
+## Available Tools (24)
 
 ### Connection
 
@@ -197,6 +201,7 @@ Or run via Docker:
 |------|-------------|
 | `lnc_list_channels` | Active/inactive channels with capacity, balances |
 | `lnc_pending_channels` | Channels being opened or closed |
+| `lnc_propose_channel_actions` | Read-only channel action recommendations |
 
 ### Invoices
 
@@ -212,6 +217,24 @@ Or run via Docker:
 |------|-------------|
 | `lnc_list_payments` | Payment history with pagination |
 | `lnc_track_payment` | Track specific payment by hash |
+
+### Health
+
+| Tool | Description |
+|------|-------------|
+| `lnc_node_health` | Read-only node health summary and alert signals |
+
+### Fees
+
+| Tool | Description |
+|------|-------------|
+| `lnc_propose_fees` | Read-only fee policy recommendations |
+
+### Rebalance
+
+| Tool | Description |
+|------|-------------|
+| `lnc_propose_rebalance` | Read-only circular rebalance candidates |
 
 ### Peers & Network
 
@@ -229,16 +252,27 @@ Or run via Docker:
 | `lnc_get_transactions` | On-chain transaction history |
 | `lnc_estimate_fee` | Fee estimates for confirmation targets |
 
+### Node Ops
+
+| Tool | Description |
+|------|-------------|
+| `lnc_query_node_ops_audit` | Query the local node-ops audit ledger |
+| `lnc_execute_fee_set` | Submit a gated fee policy update to `node-ops-daemon` |
+| `lnc_execute_rebalance` | Submit a gated circular rebalance to `node-ops-daemon` |
+
 ## Security Model
 
 - **No stored credentials:** Pairing phrase is handled in-memory only. Ephemeral
   ECDSA keypairs are generated per session.
-- **Read-only:** No payment, channel, or state-changing operations are exposed.
-  The agent can observe but not modify.
+- **Read-only LNC access:** LNC-backed tools do not expose payments, channel
+  mutation, or direct state-changing RPCs.
+- **Daemon-gated node ops:** Fee-set and rebalance tools submit requests to
+  `node-ops-daemon`; the MCP server never receives LND write credentials, and
+  execution requires daemon limits plus operator approval.
 - **Encrypted tunnels:** All traffic is encrypted end-to-end through the mailbox
   relay. The mailbox cannot read the traffic.
-- **No direct access:** The agent machine never connects directly to the lnd
-  node's gRPC port — all traffic goes through the mailbox.
+- **No direct LNC access:** LNC traffic goes through the mailbox. Node-ops
+  requests use the local daemon socket rather than direct LND gRPC.
 
 ### Comparison with Direct gRPC Access
 
@@ -247,7 +281,7 @@ Or run via Docker:
 | **Credential** | Pairing phrase (in-memory) | TLS cert + macaroon (on disk) |
 | **Network** | WebSocket via mailbox relay | Direct TCP to gRPC port |
 | **Firewall** | No inbound ports needed | Port 10009 must be reachable |
-| **Permissions** | Read-only (hardcoded) | Depends on macaroon scope |
+| **Permissions** | Read-only LNC tools plus daemon-gated node-ops approvals | Depends on macaroon scope |
 | **Setup** | Pairing phrase from Lightning Terminal | Export cert + macaroon files |
 
 ## Prerequisites

@@ -117,3 +117,4 @@ docker compose -f skills/lnd/templates/docker-compose-regtest.yml --profile two-
 - `skills/lightning-mcp-server/SKILL.md` — MCP server build & configuration
 - `skills/lnc-app/SKILL.md` — Lightning Node Connect pairing details
 - `docs/mcp-server.md` — MCP transport / tool reference
+- `docs/node-ops-regtest-e2e.md` — full gated fee-set/rebalance proof on a disposable regtest stack
