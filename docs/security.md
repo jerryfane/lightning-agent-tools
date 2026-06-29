@@ -9,6 +9,28 @@ credentials required for its task and keep private keys on a separate machine.
 The kit enforces this through three tiers of access, each with different trust
 assumptions and failure modes.
 
+## Non-Negotiable Boundaries
+
+Use these rules before choosing any setup:
+
+- Do not expose wallet seeds or private keys to model-callable agents. In
+  production, put them on a remote signer and run the agent-facing node in
+  watch-only mode.
+- Do not give model-callable agents `admin.macaroon` for routine work. For
+  direct agent LND access, bake an agent-facing role such as `pay-only`,
+  `invoice-only`, `read-only`, or `channel-admin`. Use `signer-only` only for
+  the watch-only node's remote signer connection, and use `node-ops` only for
+  `node-ops-daemon`.
+- Do not hand the `node-ops` macaroon to the MCP server or an LLM host. It
+  belongs to `node-ops-daemon`, which enforces limits, approvals, the
+  kill-switch, and audit logging.
+- Do not approve daemon requests through the same model-callable MCP session
+  that submitted them. Operator approval uses the separate operator socket and
+  token.
+- Do not bypass the approval or audit gate with direct `lncli`, `bos`, LNDg, or
+  admin-macaroon calls when validating a node-ops workflow. If a request should
+  be governed, it should pass through the daemon.
+
 ## Three Tiers of Access
 
 ```mermaid
@@ -94,14 +116,20 @@ per session. When the session ends, the keypair is discarded.
 
 This tier exposes read-only LNC tools. The agent can query balances, list
 channels, decode invoices, and inspect the network graph through LNC. Supported
-node-ops writes are not direct LNC mutations; they are local daemon requests
-with scoped credentials, limits, approvals, and audit logging enforced outside
-the MCP session. Fee-set and rebalance approvals require the separate operator
-socket plus a private operator token file that is not passed to the MCP server.
+node-ops write requests are not direct LNC mutations; they are local daemon
+requests with scoped credentials, limits, approvals, and audit logging enforced
+outside the MCP session. In the current repository, gated writes are
+code-enforced `regtest` only: config validation and the LND executor reject any
+`required_network` other than `regtest`. Fee-set and rebalance approvals require
+the separate operator socket plus a private operator token file that is not
+passed to the MCP server.
 
 **If the agent machine is compromised,** the attacker gains read access to the
-node's state for the duration of the active LNC session. Once the session is
-closed, no credentials remain to reconnect.
+node's state for the duration of the active LNC session. When node-ops request
+tools are configured, the attacker can also queue fee-set or rebalance requests,
+but cannot approve them or execute them directly because the operator token and
+daemon-held `node-ops` macaroon stay outside the MCP server. Once the session is
+closed, no LNC credentials remain to reconnect.
 
 **Setup:** Use the `lightning-mcp-server` skill. See [MCP Server](mcp-server.md) for the
 setup walkthrough.
@@ -197,7 +225,7 @@ version control, and don't transmit them over unencrypted channels.
 
 ### Preset Roles
 
-The `macaroon-bakery` skill provides five preset roles that cover common agent
+The `macaroon-bakery` skill provides six preset roles that cover common agent
 use cases. Each role grants the minimum set of RPC permissions needed:
 
 | Role | Permissions granted | Typical use case |
@@ -207,6 +235,7 @@ use cases. Each role grants the minimum set of RPC permissions needed:
 | `read-only` | `GetInfo`, `WalletBalance`, `ChannelBalance`, `ListChannels`, `ListPeers`, `ListPayments`, `ListInvoices` | Monitoring and reporting |
 | `channel-admin` | Everything in `read-only` + `OpenChannelSync`, `CloseChannel`, `ConnectPeer` | Node management |
 | `signer-only` | `SignOutputRaw`, `ComputeInputScript`, `MuSig2Sign`, `DeriveKey`, `DeriveNextKey` | Remote signer credentials |
+| `node-ops` | `UpdateChannelPolicy`, route query/build permissions, `SendToRouteV2`, and read-only node/channel state | Held by `node-ops-daemon` for approved fee-set and circular-rebalance execution |
 
 ### Custom Macaroons
 
@@ -271,7 +300,12 @@ Before deploying the kit with real funds:
 6. **Set spending limits.** Configure `--max-cost` on lnget commands to cap
    per-request spending. Monitor wallet balances programmatically.
 
-7. **Back up the seed.** The signer's `seed.txt` is the only way to recover
+7. **Keep node-ops gated.** The MCP execute tools should only submit requests
+   to `node-ops-daemon`. Keep `~/.node-ops/node-ops.macaroon` and
+   `~/.node-ops/operator.token` out of the MCP host process, and use the audit
+   ledger to verify what was queued, approved, rejected, or executed.
+
+8. **Back up the seed.** The signer's `seed.txt` is the only way to recover
    funds if the signer's storage fails. Store the 24-word mnemonic securely
    offline.
 
@@ -290,6 +324,11 @@ Every credential and secret file the kit manages:
 | `~/.lnget/signer/seed.txt` | 0600 | Signer | Signer 24-word mnemonic |
 | `~/.lnd/data/chain/bitcoin/<network>/admin.macaroon` | 0600 | Agent | lnd admin macaroon |
 | `~/.lnd-signer/data/chain/bitcoin/<network>/admin.macaroon` | 0600 | Signer | Signer admin macaroon |
+| `~/.node-ops/node-ops.macaroon` | 0600 | Daemon host | Scoped daemon write credential; not for the MCP server |
+| `~/.node-ops/operator.token` | 0600 | Operator | Human/operator approval credential |
+| `~/.node-ops/ledger.db` | umask-dependent; directory 0700 | Daemon host | SQLite audit ledger |
+| `~/.node-ops/limits-state.json` | 0600 | Daemon host | Persisted budgets and cooldowns |
+| `~/.node-ops/STOP` | n/a | Daemon host | Kill-switch file; presence halts execution |
 | `~/.lnget/tokens/<domain>/` | 0700 | Agent | Cached L402 tokens |
 | `~/.aperture/aperture.yaml` | 0600 | Seller | Aperture config (may contain credentials) |
 

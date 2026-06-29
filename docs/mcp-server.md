@@ -17,6 +17,24 @@ explore the network graph. The only write paths are `lnc_execute_fee_set` and
 MCP server never receives LND write credentials and the daemon enforces caps,
 cooldowns, approvals, the kill-switch, and audit logging before any node write.
 
+## Capability Model
+
+Treat MCP as an observation and request surface, not as a wallet-control
+surface.
+
+| Tool family | Examples | Credential path | Can mutate LND? |
+|-------------|----------|-----------------|-----------------|
+| Connection and LNC reads | `lnc_connect`, `lnc_get_info`, `lnc_list_channels`, `lnc_list_payments` | In-memory LNC pairing session | No |
+| Proposals | `lnc_propose_fees`, `lnc_propose_rebalance`, `lnc_propose_channel_actions` | Same read-only LNC session | No |
+| Audit queries | `lnc_query_node_ops_audit` | Local daemon socket; no LNC session required | No |
+| Gated execution requests | `lnc_execute_fee_set`, `lnc_execute_rebalance` | Local daemon socket; daemon holds the scoped `node-ops` macaroon | Only after daemon checks and operator approval |
+
+The last row is deliberately phrased as "requests". The MCP server validates
+argument shape and forwards JSON over the local Unix socket. The daemon decides
+whether a request is rejected, persisted as pending, or executed after an
+operator approval. The MCP server cannot approve its own request, cannot load
+`~/.node-ops/operator.token`, and cannot use `~/.node-ops/node-ops.macaroon`.
+
 ## How LNC Works
 
 Lightning Node Connect establishes an end-to-end encrypted WebSocket tunnel
@@ -201,6 +219,38 @@ The server organizes its tools into these categories:
 | `lnc_execute_fee_set` | Submit a gated fee policy update to `node-ops-daemon` |
 | `lnc_execute_rebalance` | Submit a gated circular rebalance to `node-ops-daemon` |
 
+## Node-Ops Request Lifecycle
+
+The node-ops tools use the daemon boundary from
+[ADR-0001](adr/0001-governance-daemon.md):
+
+```mermaid
+sequenceDiagram
+    participant Host as MCP host
+    participant MCP as lightning-mcp-server
+    participant D as node-ops-daemon
+    participant Op as Operator
+    participant LND as lnd
+
+    Host->>MCP: lnc_execute_fee_set(args)
+    MCP->>D: execute_fee_set over ~/.node-ops/daemon.sock
+    D->>D: Validate request, limits, cooldowns, network, kill-switch
+    D->>D: Insert audit row
+    D-->>MCP: pending + request_id
+    MCP-->>Host: pending + request_id
+    Op->>D: approve on operator socket with operator token
+    D->>LND: UpdateChannelPolicy with scoped node-ops macaroon
+    D->>D: Insert executed/rejected/failed audit row
+```
+
+The same lifecycle applies to `lnc_execute_rebalance`, except the daemon checks
+the requested outgoing channel, incoming channel, amount, and maximum fee rate
+before it attempts the bounded route-send. Gated writes are code-enforced
+`regtest` only in the current implementation: config validation and the LND
+executor reject any `required_network` other than `regtest`. Do not treat these
+execute tools as a mainnet production automation path unless the implementation
+itself changes.
+
 ## MCP-LNC vs Direct gRPC
 
 The MCP server and direct gRPC access (via `lncli` or the `lnd` skill) serve
@@ -212,7 +262,7 @@ different purposes:
 | **Network** | WebSocket via mailbox relay | Direct TCP to gRPC port |
 | **Firewall** | No inbound ports needed | Port 10009 must be reachable |
 | **Capabilities** | Read-only LNC query tools plus daemon-gated node-ops requests | Full node control |
-| **Permissions** | Read-only LNC tools plus daemon-gated node-ops approvals | Configurable via macaroon scope |
+| **Permissions** | Read-only LNC tools; execute tools only queue daemon requests | Configurable via macaroon scope |
 | **Setup** | Pairing phrase from Lightning Terminal | Export TLS cert and macaroon files |
 
 **Use MCP-LNC when** the agent needs to observe node state: checking balances,

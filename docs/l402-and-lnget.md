@@ -65,6 +65,23 @@ instantly. This is what makes L402 native to agent workflows: agents can
 discover and pay for resources on the fly without requiring a human to pre-register
 accounts.
 
+## Buyer and Seller Responsibilities
+
+L402 splits responsibility cleanly between the buyer, seller, and Lightning
+nodes:
+
+| Role | Component | Responsibility | Credential to scope |
+|------|-----------|----------------|---------------------|
+| Buyer agent | `lnget` | Detect 402 challenges, enforce cost limits, pay invoices, cache tokens, retry requests | `pay-only` macaroon, LNC pairing, or neutrino wallet |
+| Buyer node | lnd or lnget's selected backend | Route the Lightning payment and return the preimage | Remote-signer setup for production funds |
+| Seller proxy | `aperture` | Price protected paths, generate challenges, validate tokens, proxy paid requests | `invoice-only` macaroon |
+| Seller backend | Any HTTP service | Serve the resource after aperture authenticates the request | No Lightning credential required |
+
+The L402 token proves a specific payment for a server challenge. It is not a
+wallet key and cannot spend funds by itself, but it can grant access to the paid
+resource until it expires. Store token caches with the same care as other bearer
+tokens.
+
 ## lnget
 
 `lnget` automates the entire L402 flow in a single command:
@@ -167,6 +184,12 @@ For node-level spending limits, use the `macaroon-bakery` to bake a `pay-only`
 macaroon. This restricts the agent to payment operations only and prevents it
 from opening channels, modifying configuration, or performing other
 state-changing operations on the node.
+
+These controls are separate from the `node-ops-daemon` approval queue. L402
+purchases are buyer-initiated HTTP requests, so the normal guardrails are
+`--max-cost`, preview mode, wallet/channel monitoring, and a scoped payment
+credential. Fee-set and rebalance requests are different: they go through the
+daemon because they mutate node policy or liquidity state.
 
 ### Exit Codes
 
