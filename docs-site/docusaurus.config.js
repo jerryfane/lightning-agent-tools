@@ -2,6 +2,15 @@ const repoEditBase =
   'https://github.com/jerryfane/lightning-agent-tools/edit/main';
 
 function editUrl({docPath}) {
+  if (docPath === 'generated/skills/index.md') {
+    return undefined;
+  }
+
+  const generatedSkill = docPath.match(/^generated\/skills\/([^/]+)\.md$/);
+  if (generatedSkill) {
+    return `${repoEditBase}/skills/${generatedSkill[1]}/SKILL.md`;
+  }
+
   if (docPath.startsWith('generated/')) {
     return `${repoEditBase}/docs/${docPath.slice('generated/'.length)}`;
   }
