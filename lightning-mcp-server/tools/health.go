@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -97,14 +98,24 @@ func (s *HealthService) HandleNodeHealth(ctx context.Context,
 	}
 
 	for _, ch := range pending.WaitingCloseChannels {
+		idPrefix := "channel:waiting-close"
+		severity := "warning"
+		message := "Channel waiting to close"
+		if waitingCloseLooksForceClosed(ch) {
+			idPrefix = "channel:force-close"
+			severity = "critical"
+			message = "Force-closing channel detected"
+		}
 		alerts = append(alerts, map[string]any{
-			"id":                healthAlertID("channel:waiting-close", ch.Channel.ChannelPoint),
-			"severity":          "warning",
+			"id":                healthAlertID(idPrefix, ch.Channel.ChannelPoint),
+			"severity":          severity,
 			"category":          "channel",
-			"message":           "Channel waiting to close",
+			"message":           message,
 			"channel_point":     ch.Channel.ChannelPoint,
 			"remote_node_pub":   ch.Channel.RemoteNodePub,
 			"limbo_balance_sat": ch.LimboBalance,
+			"chan_status_flags": ch.Channel.ChanStatusFlags,
+			"closing_txid":      ch.ClosingTxid,
 		})
 	}
 
@@ -185,4 +196,15 @@ func healthSeverityRank(severity any) int {
 	default:
 		return 2
 	}
+}
+
+func waitingCloseLooksForceClosed(
+	ch *lnrpc.PendingChannelsResponse_WaitingCloseChannel) bool {
+
+	if ch == nil {
+		return false
+	}
+	flags := ch.GetChannel().GetChanStatusFlags()
+	return strings.Contains(flags, "ChanStatusBorked") ||
+		strings.Contains(flags, "ChanStatusCommitBroadcasted")
 }

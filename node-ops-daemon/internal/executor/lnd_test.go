@@ -5,12 +5,51 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/lightningnetwork/lnd/lnrpc"
+	"google.golang.org/grpc"
 )
+
+type mockLNDHealthClient struct {
+	lnrpc.LightningClient
+	info       *lnrpc.GetInfoResponse
+	infoErr    error
+	pending    *lnrpc.PendingChannelsResponse
+	pendingErr error
+	peers      *lnrpc.ListPeersResponse
+	peersErr   error
+}
+
+func (m *mockLNDHealthClient) GetInfo(context.Context,
+	*lnrpc.GetInfoRequest, ...grpc.CallOption) (*lnrpc.GetInfoResponse, error) {
+
+	return m.info, m.infoErr
+}
+
+func (m *mockLNDHealthClient) PendingChannels(context.Context,
+	*lnrpc.PendingChannelsRequest,
+	...grpc.CallOption) (*lnrpc.PendingChannelsResponse, error) {
+
+	return m.pending, m.pendingErr
+}
+
+func (m *mockLNDHealthClient) ListPeers(context.Context,
+	*lnrpc.ListPeersRequest, ...grpc.CallOption) (*lnrpc.ListPeersResponse, error) {
+
+	return m.peers, m.peersErr
+}
+
+func newTestHealthExecutor(client lnrpc.LightningClient) *LNDExecutor {
+	return &LNDExecutor{
+		client:          client,
+		requiredNetwork: "regtest",
+		requestTimeout:  time.Second,
+	}
+}
 
 func TestNewLNDExecutorRejectsNonRegtest(t *testing.T) {
 	_, err := NewLNDExecutor(context.Background(), LNDConfig{
@@ -23,6 +62,245 @@ func TestNewLNDExecutorRejectsNonRegtest(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "regtest") {
 		t.Fatalf("expected regtest-only error, got %v", err)
+	}
+}
+
+func TestLNDExecutorNodeHealthHealthy(t *testing.T) {
+	exec := newTestHealthExecutor(&mockLNDHealthClient{
+		info: &lnrpc.GetInfoResponse{
+			IdentityPubkey: "node",
+			Alias:          "test-node",
+			SyncedToChain:  true,
+			SyncedToGraph:  true,
+			BlockHeight:    42,
+			Chains: []*lnrpc.Chain{{
+				Chain:   "bitcoin",
+				Network: "regtest",
+			}},
+		},
+		pending: &lnrpc.PendingChannelsResponse{},
+		peers:   &lnrpc.ListPeersResponse{},
+	})
+
+	got, err := exec.NodeHealth(context.Background())
+	if err != nil {
+		t.Fatalf("NodeHealth: %v", err)
+	}
+	if got.OverallStatus != "healthy" || got.AlertCount != 0 ||
+		got.CriticalCount != 0 || got.WarningCount != 0 {
+
+		t.Fatalf("unexpected healthy snapshot: %+v", got)
+	}
+	if got.NodeID != "node" || got.Alias != "test-node" ||
+		!got.SyncedToChain || !got.SyncedToGraph || got.BlockHeight != 42 {
+
+		t.Fatalf("unexpected node metadata: %+v", got)
+	}
+}
+
+func TestLNDExecutorNodeHealthPrioritizesCriticalAlerts(t *testing.T) {
+	exec := newTestHealthExecutor(&mockLNDHealthClient{
+		info: &lnrpc.GetInfoResponse{
+			IdentityPubkey: "node",
+			Alias:          "test-node",
+			SyncedToChain:  true,
+			SyncedToGraph:  false,
+			BlockHeight:    42,
+			Chains: []*lnrpc.Chain{{
+				Chain:   "bitcoin",
+				Network: "regtest",
+			}},
+		},
+		pending: &lnrpc.PendingChannelsResponse{
+			PendingForceClosingChannels: []*lnrpc.PendingChannelsResponse_ForceClosedChannel{
+				{
+					Channel: &lnrpc.PendingChannelsResponse_PendingChannel{
+						ChannelPoint:  "force:0",
+						RemoteNodePub: "remote-force",
+					},
+					LimboBalance:      10_000,
+					BlocksTilMaturity: 3,
+					ClosingTxid:       "close-tx",
+				},
+			},
+			WaitingCloseChannels: []*lnrpc.PendingChannelsResponse_WaitingCloseChannel{
+				{
+					Channel: &lnrpc.PendingChannelsResponse_PendingChannel{
+						ChannelPoint:  "waiting:1",
+						RemoteNodePub: "remote-waiting",
+					},
+					LimboBalance: 5_000,
+				},
+			},
+		},
+		peers: &lnrpc.ListPeersResponse{
+			Peers: []*lnrpc.Peer{{
+				PubKey:    "peer",
+				Address:   "127.0.0.1:9735",
+				FlapCount: 10,
+			}},
+		},
+	})
+
+	got, err := exec.NodeHealth(context.Background())
+	if err != nil {
+		t.Fatalf("NodeHealth: %v", err)
+	}
+	if got.OverallStatus != "critical" || got.AlertCount != 4 ||
+		got.CriticalCount != 1 || got.WarningCount != 3 {
+
+		t.Fatalf("unexpected alert counts: %+v", got)
+	}
+	if got.Alerts[0].ID != "channel:force-close:force:0" ||
+		got.Alerts[0].Severity != "critical" {
+
+		t.Fatalf("critical alert not first: %+v", got.Alerts)
+	}
+	wantIDs := []string{
+		"channel:force-close:force:0",
+		"sync:graph",
+		"channel:waiting-close:waiting:1",
+		"peer:flap:peer",
+	}
+	for i, want := range wantIDs {
+		if got.Alerts[i].ID != want {
+			t.Fatalf("alert %d id = %q, want %q", i, got.Alerts[i].ID, want)
+		}
+	}
+	if got.Alerts[0].Details["closing_txid"] != "close-tx" {
+		t.Fatalf("force-close details missing: %+v", got.Alerts[0].Details)
+	}
+}
+
+func TestLNDExecutorNodeHealthClassifiesForceCloseWaitingClose(t *testing.T) {
+	exec := newTestHealthExecutor(&mockLNDHealthClient{
+		info: &lnrpc.GetInfoResponse{
+			IdentityPubkey: "node",
+			Alias:          "test-node",
+			SyncedToChain:  true,
+			SyncedToGraph:  true,
+			Chains: []*lnrpc.Chain{{
+				Chain:   "bitcoin",
+				Network: "regtest",
+			}},
+		},
+		pending: &lnrpc.PendingChannelsResponse{
+			WaitingCloseChannels: []*lnrpc.PendingChannelsResponse_WaitingCloseChannel{
+				{
+					Channel: &lnrpc.PendingChannelsResponse_PendingChannel{
+						ChannelPoint:    "waiting:1",
+						RemoteNodePub:   "remote-waiting",
+						ChanStatusFlags: "ChanStatusBorked|ChanStatusCommitBroadcasted",
+					},
+					LimboBalance: 5000,
+					Commitments:  &lnrpc.PendingChannelsResponse_Commitments{},
+					ClosingTxid:  "force-close-tx",
+				},
+			},
+		},
+		peers: &lnrpc.ListPeersResponse{},
+	})
+
+	got, err := exec.NodeHealth(context.Background())
+	if err != nil {
+		t.Fatalf("NodeHealth: %v", err)
+	}
+	if got.OverallStatus != "critical" || got.CriticalCount != 1 ||
+		got.WarningCount != 0 || got.AlertCount != 1 {
+
+		t.Fatalf("unexpected force-close snapshot: %+v", got)
+	}
+	alert := got.Alerts[0]
+	if alert.ID != "channel:force-close:waiting:1" ||
+		alert.Severity != "critical" ||
+		alert.Message != "Force-closing channel detected" {
+
+		t.Fatalf("unexpected force-close alert: %+v", alert)
+	}
+	if alert.Details["closing_txid"] != "force-close-tx" {
+		t.Fatalf("closing tx detail missing: %+v", alert.Details)
+	}
+}
+
+func TestLNDExecutorNodeHealthKeepsOrdinaryWaitingCloseWarning(t *testing.T) {
+	exec := newTestHealthExecutor(&mockLNDHealthClient{
+		info: &lnrpc.GetInfoResponse{
+			IdentityPubkey: "node",
+			Alias:          "test-node",
+			SyncedToChain:  true,
+			SyncedToGraph:  true,
+			Chains: []*lnrpc.Chain{{
+				Chain:   "bitcoin",
+				Network: "regtest",
+			}},
+		},
+		pending: &lnrpc.PendingChannelsResponse{
+			WaitingCloseChannels: []*lnrpc.PendingChannelsResponse_WaitingCloseChannel{
+				{
+					Channel: &lnrpc.PendingChannelsResponse_PendingChannel{
+						ChannelPoint:  "waiting:1",
+						RemoteNodePub: "remote-waiting",
+					},
+					LimboBalance: 5000,
+					Commitments:  &lnrpc.PendingChannelsResponse_Commitments{},
+					ClosingTxid:  "close-tx",
+				},
+			},
+		},
+		peers: &lnrpc.ListPeersResponse{},
+	})
+
+	got, err := exec.NodeHealth(context.Background())
+	if err != nil {
+		t.Fatalf("NodeHealth: %v", err)
+	}
+	if got.OverallStatus != "degraded" || got.CriticalCount != 0 ||
+		got.WarningCount != 1 || got.AlertCount != 1 {
+
+		t.Fatalf("unexpected waiting-close snapshot: %+v", got)
+	}
+	alert := got.Alerts[0]
+	if alert.ID != "channel:waiting-close:waiting:1" ||
+		alert.Severity != "warning" ||
+		alert.Message != "Channel waiting to close" {
+
+		t.Fatalf("unexpected waiting-close alert: %+v", alert)
+	}
+}
+
+func TestLNDExecutorNodeHealthRequiresConfiguredNetwork(t *testing.T) {
+	exec := newTestHealthExecutor(&mockLNDHealthClient{
+		info: &lnrpc.GetInfoResponse{
+			Chains: []*lnrpc.Chain{{
+				Chain:   "bitcoin",
+				Network: "mainnet",
+			}},
+		},
+		pending: &lnrpc.PendingChannelsResponse{},
+		peers:   &lnrpc.ListPeersResponse{},
+	})
+
+	_, err := exec.NodeHealth(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "regtest") {
+		t.Fatalf("expected regtest network error, got %v", err)
+	}
+}
+
+func TestLNDExecutorNodeHealthSurfacesReadErrors(t *testing.T) {
+	exec := newTestHealthExecutor(&mockLNDHealthClient{
+		info: &lnrpc.GetInfoResponse{
+			Chains: []*lnrpc.Chain{{
+				Chain:   "bitcoin",
+				Network: "regtest",
+			}},
+		},
+		pendingErr: errors.New("pending failed"),
+		peers:      &lnrpc.ListPeersResponse{},
+	})
+
+	_, err := exec.NodeHealth(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "pending failed") {
+		t.Fatalf("expected pending read error, got %v", err)
 	}
 }
 
