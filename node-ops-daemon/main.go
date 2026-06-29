@@ -26,6 +26,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/config"
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/daemon"
@@ -54,7 +55,14 @@ func main() {
 	}
 	sockPath := filepath.Join(home, ".node-ops", "daemon.sock")
 
-	d, err := daemon.New(cfg, &executor.StubExecutor{})
+	nodeExec, err := newNodeExecutor(context.Background(), cfg)
+	if err != nil {
+		log.Printf("warn: concrete LND executor unavailable; "+
+			"writes will fail closed: %v", err)
+		nodeExec = &executor.StubExecutor{}
+	}
+
+	d, err := daemon.New(cfg, nodeExec)
 	if err != nil {
 		log.Fatalf("init daemon: %v", err)
 	}
@@ -63,8 +71,30 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	fmt.Printf("node-ops-daemon: socket %s  ledger %s\n", sockPath, cfg.Storage.LedgerPath)
-	if err := d.Run(ctx, sockPath); err != nil {
+	fmt.Printf("node-ops-daemon: socket %s  operator %s  ledger %s\n",
+		sockPath, cfg.Operator.ApprovalSocket, cfg.Storage.LedgerPath)
+	if err := d.RunWithOperator(ctx, sockPath, cfg.Operator.ApprovalSocket); err != nil {
 		log.Fatalf("daemon: %v", err)
 	}
+}
+
+func newNodeExecutor(ctx context.Context,
+	cfg *config.Config) (executor.NodeExecutor, error) {
+
+	dialTimeout, err := time.ParseDuration(cfg.Node.DialTimeout)
+	if err != nil {
+		return nil, err
+	}
+	requestTimeout, err := time.ParseDuration(cfg.Node.RequestTimeout)
+	if err != nil {
+		return nil, err
+	}
+	return executor.NewLNDExecutor(ctx, executor.LNDConfig{
+		RPCAddress:      cfg.Node.LndRPC,
+		MacaroonPath:    cfg.Node.MacaroonPath,
+		TLSCertPath:     cfg.Node.TLSCertPath,
+		RequiredNetwork: cfg.Node.RequiredNetwork,
+		DialTimeout:     dialTimeout,
+		RequestTimeout:  requestTimeout,
+	})
 }

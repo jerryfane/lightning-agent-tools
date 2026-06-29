@@ -53,6 +53,33 @@ type Storage struct {
 	KillswitchFile string `toml:"killswitch"`
 }
 
+// Node holds the daemon-owned LND connection and scoped macaroon settings.
+type Node struct {
+	// LndRPC is the host:port of the LND gRPC endpoint.
+	LndRPC string `toml:"lnd_rpc"`
+
+	// MacaroonPath is the node-ops scoped macaroon loaded only by the daemon.
+	MacaroonPath string `toml:"macaroon"`
+
+	// TLSCertPath is the TLS certificate used to authenticate the LND endpoint.
+	TLSCertPath string `toml:"tls_cert"`
+
+	// RequiredNetwork is the only LND network this first write path may use.
+	RequiredNetwork string `toml:"required_network"`
+
+	// DialTimeout bounds startup connection attempts.
+	DialTimeout string `toml:"dial_timeout"`
+
+	// RequestTimeout bounds individual LND RPCs.
+	RequestTimeout string `toml:"request_timeout"`
+}
+
+// Operator holds the human/operator-only approval boundary.
+type Operator struct {
+	// ApprovalSocket is the separate local socket for approve/deny actions.
+	ApprovalSocket string `toml:"approval_socket"`
+}
+
 // Monitor controls background read-only node health polling and alert output.
 type Monitor struct {
 	// Enabled starts the background monitor when the daemon starts.
@@ -76,6 +103,8 @@ type Config struct {
 	Limits   Limits   `toml:"limits"`
 	Approval Approval `toml:"approval"`
 	Storage  Storage  `toml:"storage"`
+	Node     Node     `toml:"node"`
+	Operator Operator `toml:"operator"`
 	Monitor  Monitor  `toml:"monitor"`
 }
 
@@ -104,6 +133,17 @@ func Defaults() *Config {
 			LedgerPath:      filepath.Join(base, "ledger.db"),
 			LimitsStatePath: filepath.Join(base, "limits-state.json"),
 			KillswitchFile:  filepath.Join(base, "STOP"),
+		},
+		Node: Node{
+			LndRPC:          "127.0.0.1:10009",
+			MacaroonPath:    filepath.Join(base, "node-ops.macaroon"),
+			TLSCertPath:     filepath.Join(home, ".lnd", "tls.cert"),
+			RequiredNetwork: "regtest",
+			DialTimeout:     "5s",
+			RequestTimeout:  "10s",
+		},
+		Operator: Operator{
+			ApprovalSocket: filepath.Join(base, "operator.sock"),
 		},
 		Monitor: Monitor{
 			Enabled:       false,
@@ -139,6 +179,9 @@ func (c *Config) expand() error {
 	c.Storage.LedgerPath = expandHome(c.Storage.LedgerPath, home)
 	c.Storage.LimitsStatePath = expandHome(c.Storage.LimitsStatePath, home)
 	c.Storage.KillswitchFile = expandHome(c.Storage.KillswitchFile, home)
+	c.Node.MacaroonPath = expandHome(c.Node.MacaroonPath, home)
+	c.Node.TLSCertPath = expandHome(c.Node.TLSCertPath, home)
+	c.Operator.ApprovalSocket = expandHome(c.Operator.ApprovalSocket, home)
 	c.Monitor.AlertPath = expandHome(c.Monitor.AlertPath, home)
 	return nil
 }
@@ -152,6 +195,30 @@ func (c *Config) validate() error {
 	}
 	if strings.TrimSpace(c.Storage.KillswitchFile) == "" {
 		return fmt.Errorf("storage.killswitch must not be empty")
+	}
+	if strings.TrimSpace(c.Node.LndRPC) == "" {
+		return fmt.Errorf("node.lnd_rpc must not be empty")
+	}
+	if strings.TrimSpace(c.Node.MacaroonPath) == "" {
+		return fmt.Errorf("node.macaroon must not be empty")
+	}
+	if strings.TrimSpace(c.Node.TLSCertPath) == "" {
+		return fmt.Errorf("node.tls_cert must not be empty")
+	}
+	if strings.TrimSpace(c.Node.RequiredNetwork) == "" {
+		return fmt.Errorf("node.required_network must not be empty")
+	}
+	if strings.TrimSpace(c.Node.RequiredNetwork) != "regtest" {
+		return fmt.Errorf("node.required_network must be regtest for gated writes")
+	}
+	if err := validateDuration("node.dial_timeout", c.Node.DialTimeout, true); err != nil {
+		return err
+	}
+	if err := validateDuration("node.request_timeout", c.Node.RequestTimeout, true); err != nil {
+		return err
+	}
+	if strings.TrimSpace(c.Operator.ApprovalSocket) == "" {
+		return fmt.Errorf("operator.approval_socket must not be empty")
 	}
 	if err := validateDuration("monitor.poll_interval", c.Monitor.PollInterval, true); err != nil {
 		return err

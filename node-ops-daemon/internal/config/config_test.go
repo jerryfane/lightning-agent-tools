@@ -39,6 +39,14 @@ max_fee_ppm_delta = 42
 
 		t.Fatalf("partial config should preserve monitor defaults: %+v", cfg.Monitor)
 	}
+	if cfg.Node.LndRPC == "" || cfg.Node.MacaroonPath == "" ||
+		cfg.Node.TLSCertPath == "" || cfg.Node.RequiredNetwork != "regtest" {
+
+		t.Fatalf("partial config should preserve node defaults: %+v", cfg.Node)
+	}
+	if cfg.Operator.ApprovalSocket == "" {
+		t.Fatalf("partial config should preserve operator defaults: %+v", cfg.Operator)
+	}
 }
 
 func TestLoadExpandsStoragePaths(t *testing.T) {
@@ -98,6 +106,40 @@ alert_path = "~/.node-ops/custom-alerts.jsonl"
 	}
 }
 
+func TestLoadExpandsNodeAndOperatorPaths(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	err := os.WriteFile(path, []byte(`
+[node]
+macaroon = "~/.node-ops/custom-node-ops.macaroon"
+tls_cert = "~/.lnd/custom-tls.cert"
+
+[operator]
+approval_socket = "~/.node-ops/custom-operator.sock"
+`), 0600)
+	if err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir: %v", err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if want := filepath.Join(home, ".node-ops", "custom-node-ops.macaroon"); cfg.Node.MacaroonPath != want {
+		t.Fatalf("macaroon path = %q, want %q", cfg.Node.MacaroonPath, want)
+	}
+	if want := filepath.Join(home, ".lnd", "custom-tls.cert"); cfg.Node.TLSCertPath != want {
+		t.Fatalf("tls cert path = %q, want %q", cfg.Node.TLSCertPath, want)
+	}
+	if want := filepath.Join(home, ".node-ops", "custom-operator.sock"); cfg.Operator.ApprovalSocket != want {
+		t.Fatalf("operator socket = %q, want %q", cfg.Operator.ApprovalSocket, want)
+	}
+}
+
 func TestLoadRejectsEmptyStoragePaths(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -127,6 +169,91 @@ func TestLoadRejectsEmptyStoragePaths(t *testing.T) {
 	killswitch = " "
 	`,
 			wantErr: "storage.killswitch",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(tc.body), 0600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+
+			_, err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected %q error, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidNodeAndOperatorConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{
+			name: "lnd rpc",
+			body: `
+[node]
+lnd_rpc = ""
+`,
+			wantErr: "node.lnd_rpc",
+		},
+		{
+			name: "macaroon",
+			body: `
+[node]
+macaroon = ""
+`,
+			wantErr: "node.macaroon",
+		},
+		{
+			name: "tls cert",
+			body: `
+[node]
+tls_cert = " "
+`,
+			wantErr: "node.tls_cert",
+		},
+		{
+			name: "required network",
+			body: `
+[node]
+required_network = ""
+`,
+			wantErr: "node.required_network",
+		},
+		{
+			name: "mainnet rejected",
+			body: `
+[node]
+required_network = "mainnet"
+`,
+			wantErr: "node.required_network",
+		},
+		{
+			name: "dial timeout",
+			body: `
+[node]
+dial_timeout = "0s"
+`,
+			wantErr: "node.dial_timeout",
+		},
+		{
+			name: "request timeout",
+			body: `
+[node]
+request_timeout = "nope"
+`,
+			wantErr: "node.request_timeout",
+		},
+		{
+			name: "operator socket",
+			body: `
+[operator]
+approval_socket = " "
+`,
+			wantErr: "operator.approval_socket",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

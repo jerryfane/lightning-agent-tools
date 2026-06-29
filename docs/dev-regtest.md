@@ -1,8 +1,8 @@
 # Dev environment & regtest harness
 
-The development loop for working on `lightning-mcp-server` (and, going forward, the
-node-ops write path): **build the server, stand up a throwaway regtest litd node,
-and run the read tools against it.**
+The development loop for working on `lightning-mcp-server` and the node-ops
+write path: **build the server, stand up a throwaway regtest litd node, and run
+the read tools or gated node-ops tools against it.**
 
 > ⚠️ **Regtest only.** Never point experimental or write-path work at a mainnet
 > node. Regtest coins are worthless and the chain is disposable — that is the
@@ -78,7 +78,7 @@ skills/lightning-mcp-server/scripts/configure.sh --dev
 # Do not write the one-time pairing phrase to `.env` or any other file.
 ```
 
-## 6. Run the read tools end-to-end
+## 6. Run the tools end-to-end
 
 Register the built server with an MCP host (e.g. Claude Code) or run it directly,
 then exercise the read tools and confirm live data comes back from the regtest
@@ -89,7 +89,10 @@ node:
 - `lnc_get_balance` → wallet and channel balances
 - `lnc_describe_graph`, `lnc_list_peers`
 
-All 18 tools are read-only — they query state and never mutate the node.
+The LNC-backed tools are read-only. The `lnc_execute_fee_set` tool is the first
+daemon-gated write path: it submits a request to `node-ops-daemon`, which must
+be configured for regtest, hold the scoped macaroon, enforce limits and
+cooldowns, require approval when policy says so, and write audit entries.
 
 ## Teardown
 

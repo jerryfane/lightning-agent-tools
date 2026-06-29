@@ -1,10 +1,11 @@
 // Copyright (c) 2025 Lightning Labs
 // Distributed under the MIT license. See LICENSE for details.
 
-// Package main implements the read-only MCP LNC server daemon. It exposes
-// Lightning Network Daemon (LND) nodes through the Model Context Protocol (MCP)
-// using Lightning Node Connect (LNC), enabling AI assistants to securely query
-// Lightning Network data over WebSocket tunnels.
+// Package main implements the MCP LNC server daemon. It exposes Lightning
+// Network Daemon (LND) nodes through the Model Context Protocol (MCP) using
+// Lightning Node Connect (LNC), enabling AI assistants to securely query
+// Lightning Network data over WebSocket tunnels and submit daemon-gated local
+// node-ops requests.
 package main
 
 import (
@@ -58,7 +59,7 @@ func (d *Daemon) Start() error {
 	defer ctx.Cancel()
 	logger := logging.LogWithContext(ctx)
 
-	logger.Info("Starting read-only MCP LNC Server daemon",
+	logger.Info("Starting MCP LNC Server daemon",
 		zap.String("version", d.cfg.ServerVersion),
 		zap.Bool("development", d.cfg.Development),
 	)
@@ -165,7 +166,7 @@ func main() {
 
 	// Handle version flag
 	if *version {
-		fmt.Printf("MCP LNC Server %s (Read-Only)\n", cfg.ServerVersion)
+		fmt.Printf("MCP LNC Server %s\n", cfg.ServerVersion)
 		fmt.Println("Lightning Network integration for AI assistants")
 		fmt.Println("https://github.com/lightninglabs/lightning-agent-kit")
 		os.Exit(0)

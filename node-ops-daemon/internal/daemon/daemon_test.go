@@ -5,8 +5,10 @@ package daemon
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -128,6 +130,56 @@ func (f *fakeExecutor) NodeHealth(_ context.Context) (executor.NodeHealthSnapsho
 func mustJSON(t *testing.T, s string) json.RawMessage {
 	t.Helper()
 	return json.RawMessage(s)
+}
+
+func socketRoundTrip(t *testing.T, path string, req Request) Response {
+	t.Helper()
+
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatalf("Dial %s: %v", path, err)
+	}
+	defer conn.Close()
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("Marshal request: %v", err)
+	}
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(body)))
+	if _, err := conn.Write(lenBuf[:]); err != nil {
+		t.Fatalf("Write length: %v", err)
+	}
+	if _, err := conn.Write(body); err != nil {
+		t.Fatalf("Write body: %v", err)
+	}
+	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+		t.Fatalf("Read response length: %v", err)
+	}
+	respBody := make([]byte, binary.BigEndian.Uint32(lenBuf[:]))
+	if _, err := io.ReadFull(conn, respBody); err != nil {
+		t.Fatalf("Read response body: %v", err)
+	}
+	var resp Response
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		t.Fatalf("Unmarshal response: %v", err)
+	}
+	return resp
+}
+
+func waitForSocket(t *testing.T, path string) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.Dial("unix", path)
+		if err == nil {
+			_ = conn.Close()
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for socket %s", path)
 }
 
 func forceCloseHealthSnapshot() executor.NodeHealthSnapshot {
@@ -591,6 +643,37 @@ func TestDispatchBaseFeeChangeRequiresApproval(t *testing.T) {
 	}
 }
 
+func TestDispatchChecksCooldownBeforeQueueingApproval(t *testing.T) {
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{
+		1: {BaseMsat: 1_000, FeePpm: 100},
+	})
+	d := newTestDaemonWithExecutor(t, func(cfg *config.Config) {
+		cfg.Approval.RequireApproval = false
+		cfg.Limits.PerChannelCooldown = "1h"
+	}, fake)
+
+	first := d.dispatch(Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"fee_ppm":110}`),
+	})
+	if first.Status != "ok" {
+		t.Fatalf("expected first request to execute, got %+v", first)
+	}
+
+	d.cfg.Approval.RequireApproval = true
+	second := d.dispatch(Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"fee_ppm":120}`),
+	})
+	if second.Status != "error" || !strings.Contains(second.Reason, "cooldown") {
+		t.Fatalf("expected cooldown rejection before approval queue, got %+v",
+			second)
+	}
+	if pending := d.queue.ListPending(); len(pending) != 0 {
+		t.Fatalf("cooldown-limited request was queued: %+v", pending)
+	}
+}
+
 func TestDispatchRejectsPartialFeeSetParams(t *testing.T) {
 	d := newTestDaemon(t, func(cfg *config.Config) {
 		cfg.Approval.RequireApproval = false
@@ -712,6 +795,49 @@ func TestRunRefusesActiveSocket(t *testing.T) {
 		!strings.Contains(err.Error(), "already active") {
 
 		t.Fatalf("expected active socket error, got %v", err)
+	}
+}
+
+func TestRunWithOperatorSocketApprovesPendingFeeSet(t *testing.T) {
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{
+		42: {BaseMsat: 1_000, FeePpm: 100},
+	})
+	d := newTestDaemonWithExecutor(t, nil, fake)
+	dir := t.TempDir()
+	execSock := filepath.Join(dir, "daemon.sock")
+	operatorSock := filepath.Join(dir, "operator.sock")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- d.RunWithOperator(ctx, execSock, operatorSock)
+	}()
+	waitForSocket(t, execSock)
+	waitForSocket(t, operatorSock)
+
+	pending := socketRoundTrip(t, execSock, Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":42,"base_msat":1000,"fee_ppm":110}`),
+	})
+	if pending.Status != "pending" {
+		t.Fatalf("expected pending response, got %+v", pending)
+	}
+
+	approved := socketRoundTrip(t, operatorSock, Request{
+		Action: "approve_fee_set",
+		Params: mustJSON(t, `{"request_id":"`+pending.RequestID+`"}`),
+	})
+	if approved.Status != "ok" {
+		t.Fatalf("expected operator approval ok, got %+v", approved)
+	}
+	if len(fake.executed) != 1 {
+		t.Fatalf("expected socket-approved execution, got %+v", fake.executed)
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("RunWithOperator: %v", err)
 	}
 }
 
@@ -1049,6 +1175,116 @@ func TestDispatchQueuesPendingAndLogs(t *testing.T) {
 	}
 }
 
+func TestOperatorApproveExecutesPendingAndLogs(t *testing.T) {
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{
+		42: {BaseMsat: 1_000, FeePpm: 100},
+	})
+	d := newTestDaemonWithExecutor(t, nil, fake)
+
+	pending := d.dispatch(Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":42,"base_msat":1000,"fee_ppm":110}`),
+	})
+	if pending.Status != "pending" {
+		t.Fatalf("expected pending response, got %+v", pending)
+	}
+
+	approved := d.dispatchOperator(Request{
+		Action: "approve_fee_set",
+		Params: mustJSON(t, `{"request_id":"`+pending.RequestID+`"}`),
+	})
+	if approved.Status != "ok" {
+		t.Fatalf("expected approval execution ok, got %+v", approved)
+	}
+	if len(fake.executed) != 1 {
+		t.Fatalf("expected one executed fee set, got %+v", fake.executed)
+	}
+	if got := fake.executed[0]; got.ChanID != 42 || got.BaseMsat != 1_000 ||
+		got.FeePpm != 110 {
+
+		t.Fatalf("unexpected executed request: %+v", got)
+	}
+
+	entries, err := d.ledger.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	wantStatuses := []struct {
+		action string
+		status string
+	}{
+		{"execute_fee_set", "pending"},
+		{"approve_fee_set", "approved"},
+		{"execute_fee_set", "accepted"},
+		{"execute_fee_set", "executed"},
+	}
+	if len(entries) != len(wantStatuses) {
+		t.Fatalf("expected %d ledger entries, got %+v",
+			len(wantStatuses), entries)
+	}
+	for i, want := range wantStatuses {
+		if entries[i].Action != want.action || entries[i].Status != want.status {
+			t.Fatalf("entry %d = %+v, want %s/%s",
+				i, entries[i], want.action, want.status)
+		}
+	}
+}
+
+func TestOperatorDenyDoesNotExecuteAndLogs(t *testing.T) {
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{
+		42: {BaseMsat: 1_000, FeePpm: 100},
+	})
+	d := newTestDaemonWithExecutor(t, nil, fake)
+
+	pending := d.dispatch(Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":42,"base_msat":1000,"fee_ppm":110}`),
+	})
+	if pending.Status != "pending" {
+		t.Fatalf("expected pending response, got %+v", pending)
+	}
+
+	denied := d.dispatchOperator(Request{
+		Action: "deny_fee_set",
+		Params: mustJSON(t, `{"request_id":"`+pending.RequestID+`","reason":"not today"}`),
+	})
+	if denied.Status != "ok" {
+		t.Fatalf("expected denial ok, got %+v", denied)
+	}
+	if len(fake.executed) != 0 {
+		t.Fatalf("denied request executed: %+v", fake.executed)
+	}
+	if pending := d.queue.ListPending(); len(pending) != 0 {
+		t.Fatalf("denied request still pending: %+v", pending)
+	}
+
+	entries, err := d.ledger.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	wantStatuses := []struct {
+		action string
+		status string
+		reason string
+	}{
+		{"execute_fee_set", "pending", ""},
+		{"deny_fee_set", "denied", "not today"},
+		{"execute_fee_set", "denied", "not today"},
+	}
+	if len(entries) != len(wantStatuses) {
+		t.Fatalf("expected %d ledger entries, got %+v",
+			len(wantStatuses), entries)
+	}
+	for i, want := range wantStatuses {
+		if entries[i].Action != want.action || entries[i].Status != want.status ||
+			entries[i].Reason != want.reason {
+
+			t.Fatalf("entry %d = %+v, want %s/%s/%q",
+				i, entries[i], want.action, want.status, want.reason)
+		}
+	}
+}
+
 func TestExecutionSocketCannotApprove(t *testing.T) {
 	d := newTestDaemon(t, nil)
 
@@ -1068,5 +1304,13 @@ func TestExecutionSocketCannotApprove(t *testing.T) {
 		entries[0].Status != "rejected" {
 
 		t.Fatalf("unexpected ledger entries: %+v", entries)
+	}
+
+	resp = d.dispatch(Request{
+		Action: "approve_fee_set",
+		Params: mustJSON(t, `{"request_id":"pending-id"}`),
+	})
+	if resp.Status != "error" || !strings.Contains(resp.Reason, "unknown action") {
+		t.Fatalf("expected unknown action error, got %+v", resp)
 	}
 }

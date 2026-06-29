@@ -31,6 +31,25 @@ limits_state = "~/.node-ops/limits-state.json"
 # Creating this file halts all daemon execution immediately.
 killswitch = "~/.node-ops/STOP"
 
+[node]
+# LND gRPC endpoint controlled by the daemon. The first gated write path is
+# regtest-only; mainnet is intentionally rejected.
+lnd_rpc = "127.0.0.1:10009"
+required_network = "regtest"
+
+# Scoped node-ops macaroon. Do not point this at admin.macaroon.
+macaroon = "~/.node-ops/node-ops.macaroon"
+tls_cert = "~/.lnd/tls.cert"
+
+# Bound startup dials and per-RPC calls.
+dial_timeout = "5s"
+request_timeout = "10s"
+
+[operator]
+# Separate human/operator-only socket for approve/deny actions. This is not
+# exposed through the model-callable MCP server.
+approval_socket = "~/.node-ops/operator.sock"
+
 [monitor]
 # Start a background read-only node_health poller when the daemon starts.
 # Requires a concrete node_health reader; the fail-closed stub rejects startup

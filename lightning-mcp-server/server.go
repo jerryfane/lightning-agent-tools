@@ -36,7 +36,7 @@ func NewServer(cfg *config.Config, logger *zap.Logger) (*Server, error) {
 		Version: cfg.ServerVersion,
 	}, nil)
 
-	// Initialize service manager for read-only operations.
+	// Initialize service manager.
 	serviceManager := services.NewManager(logger)
 	serviceManager.InitializeServices()
 

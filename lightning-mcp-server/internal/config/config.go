@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// Config captures all runtime configuration for the read-only MCP LNC server.
+// Config captures all runtime configuration for the MCP LNC server.
 type Config struct {
 	// Server configuration.
 	ServerName    string
