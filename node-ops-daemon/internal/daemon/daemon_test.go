@@ -24,6 +24,8 @@ import (
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/queue"
 )
 
+const testOperatorToken = "test-operator-token"
+
 func newTestDaemon(t *testing.T, mutate func(*config.Config)) *Daemon {
 	return newTestDaemonWithExecutor(t, mutate, newFakeExecutor(map[uint64]executor.FeePolicy{
 		1:  {BaseMsat: 1_000, FeePpm: 100},
@@ -44,6 +46,7 @@ func newTestDaemonWithExecutor(t *testing.T, mutate func(*config.Config),
 	cfg := &config.Config{
 		Limits: config.Limits{
 			DailyRebalanceBudgetSat: 1_000,
+			DailyFeePpmBudget:       500,
 			MaxFeePpmDelta:          100,
 			PerChannelCooldown:      "0s",
 			RebalanceMaxFeePpm:      500,
@@ -57,10 +60,15 @@ func newTestDaemonWithExecutor(t *testing.T, mutate func(*config.Config),
 			LimitsStatePath: filepath.Join(storeDir, "limits-state.json"),
 			KillswitchFile:  filepath.Join(storeDir, "STOP"),
 		},
+		Operator: config.Operator{
+			ApprovalSocket:    filepath.Join(storeDir, "operator.sock"),
+			ApprovalTokenFile: filepath.Join(storeDir, "operator.token"),
+		},
 	}
 	if mutate != nil {
 		mutate(cfg)
 	}
+	installTestOperatorToken(t, cfg, storeDir)
 
 	d, err := New(cfg, exec)
 	if err != nil {
@@ -68,6 +76,24 @@ func newTestDaemonWithExecutor(t *testing.T, mutate func(*config.Config),
 	}
 	t.Cleanup(func() { _ = d.Close() })
 	return d
+}
+
+func installTestOperatorToken(t *testing.T, cfg *config.Config, dir string) {
+	t.Helper()
+	if cfg.Operator.ApprovalSocket == "" {
+		cfg.Operator.ApprovalSocket = filepath.Join(dir, "operator.sock")
+	}
+	if cfg.Operator.ApprovalTokenFile == "" {
+		cfg.Operator.ApprovalTokenFile = filepath.Join(dir, "operator.token")
+	}
+	if err := os.MkdirAll(filepath.Dir(cfg.Operator.ApprovalTokenFile), 0700); err != nil {
+		t.Fatalf("Mkdir operator token dir: %v", err)
+	}
+	if err := os.WriteFile(cfg.Operator.ApprovalTokenFile,
+		[]byte(testOperatorToken+"\n"), 0600); err != nil {
+
+		t.Fatalf("WriteFile operator token: %v", err)
+	}
 }
 
 type fakeExecutor struct {
@@ -130,6 +156,25 @@ func (f *fakeExecutor) NodeHealth(_ context.Context) (executor.NodeHealthSnapsho
 func mustJSON(t *testing.T, s string) json.RawMessage {
 	t.Helper()
 	return json.RawMessage(s)
+}
+
+func approvePendingFeeSet(t *testing.T, d *Daemon, pending Response) Response {
+	t.Helper()
+	if pending.Status != "pending" || pending.RequestID == "" {
+		t.Fatalf("expected pending fee-set response, got %+v", pending)
+	}
+	return d.dispatchOperator(operatorRequest(
+		"approve_fee_set",
+		mustJSON(t, `{"request_id":"`+pending.RequestID+`"}`),
+	))
+}
+
+func operatorRequest(action string, params json.RawMessage) Request {
+	return Request{
+		Action:        action,
+		Params:        params,
+		OperatorToken: testOperatorToken,
+	}
 }
 
 func socketRoundTrip(t *testing.T, path string, req Request) Response {
@@ -383,7 +428,7 @@ func TestDispatchIgnoresCallerOldPpm(t *testing.T) {
 	}
 }
 
-func TestDispatchAutoExecuteAppliesCooldown(t *testing.T) {
+func TestDispatchApprovalExecutionAppliesCooldown(t *testing.T) {
 	d := newTestDaemon(t, func(cfg *config.Config) {
 		cfg.Approval.RequireApproval = false
 		cfg.Limits.PerChannelCooldown = "1h"
@@ -393,8 +438,12 @@ func TestDispatchAutoExecuteAppliesCooldown(t *testing.T) {
 		Action: "execute_fee_set",
 		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"old_ppm":100,"fee_ppm":110}`),
 	})
-	if first.Status != "ok" {
-		t.Fatalf("expected first request to execute, got %+v", first)
+	if first.Status != "pending" {
+		t.Fatalf("expected first request to require approval, got %+v", first)
+	}
+	approved := approvePendingFeeSet(t, d, first)
+	if approved.Status != "ok" {
+		t.Fatalf("expected approved request to execute, got %+v", approved)
 	}
 
 	second := d.dispatch(Request{
@@ -414,6 +463,7 @@ func TestDispatchCooldownSurvivesDaemonRestart(t *testing.T) {
 	cfg := &config.Config{
 		Limits: config.Limits{
 			DailyRebalanceBudgetSat: 1_000,
+			DailyFeePpmBudget:       500,
 			MaxFeePpmDelta:          100,
 			PerChannelCooldown:      "1h",
 			RebalanceMaxFeePpm:      500,
@@ -431,6 +481,7 @@ func TestDispatchCooldownSurvivesDaemonRestart(t *testing.T) {
 	fake := newFakeExecutor(map[uint64]executor.FeePolicy{
 		1: {BaseMsat: 1_000, FeePpm: 100},
 	})
+	installTestOperatorToken(t, cfg, storeDir)
 
 	firstDaemon, err := New(cfg, fake)
 	if err != nil {
@@ -440,8 +491,12 @@ func TestDispatchCooldownSurvivesDaemonRestart(t *testing.T) {
 		Action: "execute_fee_set",
 		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"fee_ppm":110}`),
 	})
-	if first.Status != "ok" {
-		t.Fatalf("expected first request to execute, got %+v", first)
+	if first.Status != "pending" {
+		t.Fatalf("expected first request to require approval, got %+v", first)
+	}
+	approved := approvePendingFeeSet(t, firstDaemon, first)
+	if approved.Status != "ok" {
+		t.Fatalf("expected approved request to execute, got %+v", approved)
 	}
 	if err := firstDaemon.Close(); err != nil {
 		t.Fatalf("Close first daemon: %v", err)
@@ -472,6 +527,7 @@ func TestDispatchPersistsCooldownBeforeExecutorWrite(t *testing.T) {
 	cfg := &config.Config{
 		Limits: config.Limits{
 			DailyRebalanceBudgetSat: 1_000,
+			DailyFeePpmBudget:       500,
 			MaxFeePpmDelta:          100,
 			PerChannelCooldown:      "1h",
 			RebalanceMaxFeePpm:      500,
@@ -489,6 +545,7 @@ func TestDispatchPersistsCooldownBeforeExecutorWrite(t *testing.T) {
 	fake := newFakeExecutor(map[uint64]executor.FeePolicy{
 		1: {BaseMsat: 1_000, FeePpm: 100},
 	})
+	installTestOperatorToken(t, cfg, storeDir)
 	fake.onExecute = func() {
 		body, err := os.ReadFile(cfg.Storage.LimitsStatePath)
 		if err != nil {
@@ -508,8 +565,12 @@ func TestDispatchPersistsCooldownBeforeExecutorWrite(t *testing.T) {
 		Action: "execute_fee_set",
 		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"fee_ppm":110}`),
 	})
-	if resp.Status != "ok" {
-		t.Fatalf("expected execution to succeed, got %+v", resp)
+	if resp.Status != "pending" {
+		t.Fatalf("expected request to require approval, got %+v", resp)
+	}
+	approved := approvePendingFeeSet(t, d, resp)
+	if approved.Status != "ok" {
+		t.Fatalf("expected approved execution to succeed, got %+v", approved)
 	}
 }
 
@@ -521,6 +582,7 @@ func TestDispatchRefreshesCooldownAfterExecutorWrite(t *testing.T) {
 	cfg := &config.Config{
 		Limits: config.Limits{
 			DailyRebalanceBudgetSat: 1_000,
+			DailyFeePpmBudget:       500,
 			MaxFeePpmDelta:          100,
 			PerChannelCooldown:      "200ms",
 			RebalanceMaxFeePpm:      500,
@@ -538,6 +600,7 @@ func TestDispatchRefreshesCooldownAfterExecutorWrite(t *testing.T) {
 	fake := newFakeExecutor(map[uint64]executor.FeePolicy{
 		1: {BaseMsat: 1_000, FeePpm: 100},
 	})
+	installTestOperatorToken(t, cfg, storeDir)
 	fake.onExecute = func() {
 		time.Sleep(250 * time.Millisecond)
 	}
@@ -551,8 +614,12 @@ func TestDispatchRefreshesCooldownAfterExecutorWrite(t *testing.T) {
 		Action: "execute_fee_set",
 		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"fee_ppm":110}`),
 	})
-	if first.Status != "ok" {
-		t.Fatalf("expected first execution to succeed, got %+v", first)
+	if first.Status != "pending" {
+		t.Fatalf("expected first request to require approval, got %+v", first)
+	}
+	approved := approvePendingFeeSet(t, d, first)
+	if approved.Status != "ok" {
+		t.Fatalf("expected approved execution to succeed, got %+v", approved)
 	}
 	second := d.dispatch(Request{
 		Action: "execute_fee_set",
@@ -571,6 +638,7 @@ func TestDispatchExecutorFailureDoesNotPersistCooldown(t *testing.T) {
 	cfg := &config.Config{
 		Limits: config.Limits{
 			DailyRebalanceBudgetSat: 1_000,
+			DailyFeePpmBudget:       500,
 			MaxFeePpmDelta:          100,
 			PerChannelCooldown:      "1h",
 			RebalanceMaxFeePpm:      500,
@@ -588,6 +656,7 @@ func TestDispatchExecutorFailureDoesNotPersistCooldown(t *testing.T) {
 	fake := newFakeExecutor(map[uint64]executor.FeePolicy{
 		1: {BaseMsat: 1_000, FeePpm: 100},
 	})
+	installTestOperatorToken(t, cfg, storeDir)
 	fake.executeErr = errors.New("lnd rejected update")
 
 	firstDaemon, err := New(cfg, fake)
@@ -598,8 +667,14 @@ func TestDispatchExecutorFailureDoesNotPersistCooldown(t *testing.T) {
 		Action: "execute_fee_set",
 		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"fee_ppm":110}`),
 	})
-	if failed.Status != "error" || !strings.Contains(failed.Reason, "lnd rejected") {
-		t.Fatalf("expected executor failure, got %+v", failed)
+	if failed.Status != "pending" {
+		t.Fatalf("expected request to require approval, got %+v", failed)
+	}
+	failedApproval := approvePendingFeeSet(t, firstDaemon, failed)
+	if failedApproval.Status != "error" ||
+		!strings.Contains(failedApproval.Reason, "lnd rejected") {
+
+		t.Fatalf("expected executor failure, got %+v", failedApproval)
 	}
 	if err := firstDaemon.Close(); err != nil {
 		t.Fatalf("Close first daemon: %v", err)
@@ -615,8 +690,12 @@ func TestDispatchExecutorFailureDoesNotPersistCooldown(t *testing.T) {
 		Action: "execute_fee_set",
 		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"fee_ppm":110}`),
 	})
-	if second.Status != "ok" {
-		t.Fatalf("failed execution should not persist cooldown, got %+v", second)
+	if second.Status != "pending" {
+		t.Fatalf("expected retry to require approval, got %+v", second)
+	}
+	secondApproval := approvePendingFeeSet(t, restarted, second)
+	if secondApproval.Status != "ok" {
+		t.Fatalf("failed execution should not persist cooldown, got %+v", secondApproval)
 	}
 	if len(fake.executed) != 1 {
 		t.Fatalf("expected one successful execution after restart, got %+v", fake.executed)
@@ -656,11 +735,14 @@ func TestDispatchChecksCooldownBeforeQueueingApproval(t *testing.T) {
 		Action: "execute_fee_set",
 		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"fee_ppm":110}`),
 	})
-	if first.Status != "ok" {
-		t.Fatalf("expected first request to execute, got %+v", first)
+	if first.Status != "pending" {
+		t.Fatalf("expected first request to require approval, got %+v", first)
+	}
+	approved := approvePendingFeeSet(t, d, first)
+	if approved.Status != "ok" {
+		t.Fatalf("expected approved request to execute, got %+v", approved)
 	}
 
-	d.cfg.Approval.RequireApproval = true
 	second := d.dispatch(Request{
 		Action: "execute_fee_set",
 		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"fee_ppm":120}`),
@@ -748,29 +830,26 @@ func TestDispatchRechecksKillSwitchBeforeFallbackQueueing(t *testing.T) {
 	fake := newFakeExecutor(map[uint64]executor.FeePolicy{
 		1: {BaseMsat: 1_000, FeePpm: 100},
 	})
-	d := newTestDaemonWithExecutor(t, func(cfg *config.Config) {
-		cfg.Approval.RequireApproval = false
-	}, fake)
+	d := newTestDaemonWithExecutor(t, nil, fake)
 
-	var calls int
-	fake.onCurrent = func() {
-		calls++
-		switch calls {
-		case 1:
-			fake.mu.Lock()
-			fake.current[1] = executor.FeePolicy{BaseMsat: 999, FeePpm: 100}
-			fake.mu.Unlock()
-		case 2:
-			if err := os.WriteFile(d.cfg.Storage.KillswitchFile, []byte("stop"), 0600); err != nil {
-				t.Fatalf("write killswitch: %v", err)
-			}
-		}
-	}
-
-	resp := d.dispatch(Request{
+	pending := d.dispatch(Request{
 		Action: "execute_fee_set",
 		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"fee_ppm":110}`),
 	})
+	if pending.Status != "pending" {
+		t.Fatalf("expected pending request, got %+v", pending)
+	}
+
+	var once sync.Once
+	fake.onCurrent = func() {
+		once.Do(func() {
+			if err := os.WriteFile(d.cfg.Storage.KillswitchFile, []byte("stop"), 0600); err != nil {
+				t.Fatalf("write killswitch: %v", err)
+			}
+		})
+	}
+
+	resp := approvePendingFeeSet(t, d, pending)
 	if resp.Status != "error" || !strings.Contains(resp.Reason, "killswitch") {
 		t.Fatalf("expected killswitch rejection, got %+v", resp)
 	}
@@ -825,8 +904,9 @@ func TestRunWithOperatorSocketApprovesPendingFeeSet(t *testing.T) {
 	}
 
 	approved := socketRoundTrip(t, operatorSock, Request{
-		Action: "approve_fee_set",
-		Params: mustJSON(t, `{"request_id":"`+pending.RequestID+`"}`),
+		Action:        "approve_fee_set",
+		Params:        mustJSON(t, `{"request_id":"`+pending.RequestID+`"}`),
+		OperatorToken: testOperatorToken,
 	})
 	if approved.Status != "ok" {
 		t.Fatalf("expected operator approval ok, got %+v", approved)
@@ -1076,6 +1156,7 @@ func TestDispatchKillSwitchSurvivesDaemonRestart(t *testing.T) {
 	cfg := &config.Config{
 		Limits: config.Limits{
 			DailyRebalanceBudgetSat: 1_000,
+			DailyFeePpmBudget:       500,
 			MaxFeePpmDelta:          100,
 			PerChannelCooldown:      "0s",
 			RebalanceMaxFeePpm:      500,
@@ -1090,6 +1171,7 @@ func TestDispatchKillSwitchSurvivesDaemonRestart(t *testing.T) {
 			KillswitchFile:  filepath.Join(storeDir, "STOP"),
 		},
 	}
+	installTestOperatorToken(t, cfg, storeDir)
 
 	firstDaemon, err := New(cfg, newFakeExecutor(map[uint64]executor.FeePolicy{
 		1: {BaseMsat: 1_000, FeePpm: 100},
@@ -1175,6 +1257,25 @@ func TestDispatchQueuesPendingAndLogs(t *testing.T) {
 	}
 }
 
+func TestDispatchChecksDailyFeeBudgetBeforeQueueingApproval(t *testing.T) {
+	d := newTestDaemon(t, func(cfg *config.Config) {
+		cfg.Limits.DailyFeePpmBudget = 5
+	})
+
+	resp := d.dispatch(Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":42,"base_msat":1000,"fee_ppm":110}`),
+	})
+	if resp.Status != "error" ||
+		!strings.Contains(resp.Reason, "daily_fee_ppm_budget") {
+
+		t.Fatalf("expected daily fee budget rejection, got %+v", resp)
+	}
+	if pending := d.queue.ListPending(); len(pending) != 0 {
+		t.Fatalf("over-budget request was queued: %+v", pending)
+	}
+}
+
 func TestOperatorApproveExecutesPendingAndLogs(t *testing.T) {
 	fake := newFakeExecutor(map[uint64]executor.FeePolicy{
 		42: {BaseMsat: 1_000, FeePpm: 100},
@@ -1189,10 +1290,7 @@ func TestOperatorApproveExecutesPendingAndLogs(t *testing.T) {
 		t.Fatalf("expected pending response, got %+v", pending)
 	}
 
-	approved := d.dispatchOperator(Request{
-		Action: "approve_fee_set",
-		Params: mustJSON(t, `{"request_id":"`+pending.RequestID+`"}`),
-	})
+	approved := approvePendingFeeSet(t, d, pending)
 	if approved.Status != "ok" {
 		t.Fatalf("expected approval execution ok, got %+v", approved)
 	}
@@ -1230,6 +1328,45 @@ func TestOperatorApproveExecutesPendingAndLogs(t *testing.T) {
 	}
 }
 
+func TestOperatorApproveRechecksDailyFeeBudgetBeforeExecution(t *testing.T) {
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{
+		1: {BaseMsat: 1_000, FeePpm: 100},
+		2: {BaseMsat: 1_000, FeePpm: 100},
+	})
+	d := newTestDaemonWithExecutor(t, func(cfg *config.Config) {
+		cfg.Limits.DailyFeePpmBudget = 15
+	}, fake)
+
+	first := d.dispatch(Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"fee_ppm":110}`),
+	})
+	second := d.dispatch(Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":2,"base_msat":1000,"fee_ppm":110}`),
+	})
+	if first.Status != "pending" || second.Status != "pending" {
+		t.Fatalf("expected both requests to queue, got first=%+v second=%+v",
+			first, second)
+	}
+
+	firstApproval := approvePendingFeeSet(t, d, first)
+	if firstApproval.Status != "ok" {
+		t.Fatalf("expected first approval to execute, got %+v", firstApproval)
+	}
+	secondApproval := approvePendingFeeSet(t, d, second)
+	if secondApproval.Status != "error" ||
+		!strings.Contains(secondApproval.Reason, "daily_fee_ppm_budget") {
+
+		t.Fatalf("expected second approval budget rejection, got %+v",
+			secondApproval)
+	}
+	if len(fake.executed) != 1 || fake.executed[0].ChanID != 1 {
+		t.Fatalf("expected only first request to execute, got %+v",
+			fake.executed)
+	}
+}
+
 func TestOperatorDenyDoesNotExecuteAndLogs(t *testing.T) {
 	fake := newFakeExecutor(map[uint64]executor.FeePolicy{
 		42: {BaseMsat: 1_000, FeePpm: 100},
@@ -1244,10 +1381,10 @@ func TestOperatorDenyDoesNotExecuteAndLogs(t *testing.T) {
 		t.Fatalf("expected pending response, got %+v", pending)
 	}
 
-	denied := d.dispatchOperator(Request{
-		Action: "deny_fee_set",
-		Params: mustJSON(t, `{"request_id":"`+pending.RequestID+`","reason":"not today"}`),
-	})
+	denied := d.dispatchOperator(operatorRequest(
+		"deny_fee_set",
+		mustJSON(t, `{"request_id":"`+pending.RequestID+`","reason":"not today"}`),
+	))
 	if denied.Status != "ok" {
 		t.Fatalf("expected denial ok, got %+v", denied)
 	}
@@ -1312,5 +1449,33 @@ func TestExecutionSocketCannotApprove(t *testing.T) {
 	})
 	if resp.Status != "error" || !strings.Contains(resp.Reason, "unknown action") {
 		t.Fatalf("expected unknown action error, got %+v", resp)
+	}
+}
+
+func TestOperatorSocketRequiresToken(t *testing.T) {
+	d := newTestDaemon(t, nil)
+
+	missing := d.dispatchOperator(Request{
+		Action: "approve_fee_set",
+		Params: mustJSON(t, `{"request_id":"pending-id"}`),
+	})
+	if missing.Status != "error" ||
+		!strings.Contains(missing.Reason, "missing operator token") {
+
+		t.Fatalf("expected missing token rejection, got %+v", missing)
+	}
+
+	invalid := d.dispatchOperator(Request{
+		Action:        "approve_fee_set",
+		Params:        mustJSON(t, `{"request_id":"pending-id"}`),
+		OperatorToken: "wrong-token",
+	})
+	if invalid.Status != "error" ||
+		!strings.Contains(invalid.Reason, "invalid operator token") {
+
+		t.Fatalf("expected invalid token rejection, got %+v", invalid)
+	}
+	if pending := d.queue.ListPending(); len(pending) != 0 {
+		t.Fatalf("token failures should not modify queue: %+v", pending)
 	}
 }

@@ -199,6 +199,9 @@ different purposes:
 listing channels, monitoring payments, inspecting the network graph. For the
 supported fee-set write, use the node-ops daemon path so credentials, approval,
 limits, and audit stay outside the model-callable LNC session.
+Fee-set requests are submitted through the MCP tool but execute only after an
+operator approves on the separate operator socket with the private operator
+token.
 
 **Use direct gRPC when** the agent needs to perform actions: sending payments,
 opening channels, creating invoices. Direct gRPC requires the `lnd` skill and

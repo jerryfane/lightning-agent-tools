@@ -10,6 +10,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -41,8 +42,9 @@ const (
 
 // Request is the incoming message from a client.
 type Request struct {
-	Action string          `json:"action"`
-	Params json.RawMessage `json:"params"`
+	Action        string          `json:"action"`
+	Params        json.RawMessage `json:"params"`
+	OperatorToken string          `json:"operator_token,omitempty"`
 }
 
 // Response is the outgoing reply to a client.
@@ -343,6 +345,15 @@ func (d *Daemon) dispatch(req Request) Response {
 // dispatchOperator routes requests from the separate human/operator boundary.
 func (d *Daemon) dispatchOperator(req Request) Response {
 	reqID := uuid.New().String()
+	if err := d.verifyOperatorToken(req.OperatorToken); err != nil {
+		reason := "operator authentication failed: " + err.Error()
+		if recErr := d.record(reqID, req.Action, req.Params, "rejected",
+			reason); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: reason}
+	}
 
 	switch req.Action {
 	case "approve_fee_set":
@@ -367,6 +378,47 @@ func (d *Daemon) dispatchOperator(req Request) Response {
 		}
 		return Response{Status: "error", RequestID: reqID, Reason: reason}
 	}
+}
+
+func (d *Daemon) verifyOperatorToken(presented string) error {
+	presented = strings.TrimSpace(presented)
+	if presented == "" {
+		return fmt.Errorf("missing operator token")
+	}
+	expected, err := loadOperatorToken(d.cfg.Operator.ApprovalTokenFile)
+	if err != nil {
+		return err
+	}
+	if subtle.ConstantTimeCompare([]byte(presented), []byte(expected)) != 1 {
+		return fmt.Errorf("invalid operator token")
+	}
+	return nil
+}
+
+func loadOperatorToken(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", fmt.Errorf("operator token file is not configured")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("load operator token: %w", err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("operator token file is a directory")
+	}
+	if info.Mode().Perm()&0077 != 0 {
+		return "", fmt.Errorf("operator token file %s must not be group/other readable", path)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read operator token: %w", err)
+	}
+	token := strings.TrimSpace(string(body))
+	if token == "" {
+		return "", fmt.Errorf("operator token file is empty")
+	}
+	return token, nil
 }
 
 func (d *Daemon) record(reqID, action string, params json.RawMessage,
@@ -609,17 +661,13 @@ func (d *Daemon) handleFeeSet(reqID string, raw json.RawMessage) Response {
 		}
 		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
 	}
-	if err := d.limits.CheckChannelCooldown(p.ChanID); err != nil {
+	if err := d.limits.CheckFeeSet(p.ChanID, delta.ppmDelta); err != nil {
 		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
 			err.Error()); recErr != nil {
 
 			return ledgerFailure(reqID, recErr)
 		}
 		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
-	}
-
-	if !d.needsApproval(delta) {
-		return d.executeFeeSet(reqID, raw, p, false)
 	}
 
 	if resp, stopped := d.rejectIfKillSwitchActive(reqID, "execute_fee_set",
@@ -764,15 +812,6 @@ func (d *Daemon) feeSetPolicyDelta(ctx context.Context,
 	}, nil
 }
 
-func (d *Daemon) needsApproval(delta feeSetPolicyDelta) bool {
-	ppmDelta := delta.ppmDelta
-	if ppmDelta < 0 {
-		ppmDelta = -ppmDelta
-	}
-	return d.cfg.Approval.RequireApproval || delta.baseChanged ||
-		ppmDelta > d.cfg.Approval.AutoExecuteBelowPpmDelta
-}
-
 func (d *Daemon) handleApproveFeeSet(reqID string, raw json.RawMessage) Response {
 	params, err := parseApprovalParams(raw)
 	if err != nil {
@@ -897,7 +936,7 @@ func (d *Daemon) executeFeeSet(reqID string, raw json.RawMessage,
 		}
 		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
 	}
-	if d.needsApproval(delta) && !approvalSatisfied {
+	if !approvalSatisfied {
 		if resp, stopped := d.rejectIfKillSwitchActive(reqID, "execute_fee_set",
 			raw); stopped {
 
@@ -910,7 +949,9 @@ func (d *Daemon) executeFeeSet(reqID string, raw json.RawMessage,
 
 		return resp
 	}
-	reservation, err := d.limits.ReserveChannelOperation(p.ChanID)
+	reservation, err := d.limits.ReserveFeeSetOperation(
+		p.ChanID, delta.ppmDelta,
+	)
 	if err != nil {
 		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
 			err.Error()); recErr != nil {
@@ -921,7 +962,7 @@ func (d *Daemon) executeFeeSet(reqID string, raw json.RawMessage,
 	}
 	if killswitch.Active(d.cfg.Storage.KillswitchFile) {
 		reason := "killswitch active: all execution is halted"
-		if rollbackErr := d.limits.RollbackChannelOperation(reservation); rollbackErr != nil {
+		if rollbackErr := d.limits.RollbackFeeSetOperation(reservation); rollbackErr != nil {
 			reason = reason + "; limits rollback failed: " + rollbackErr.Error()
 		}
 		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
@@ -932,14 +973,14 @@ func (d *Daemon) executeFeeSet(reqID string, raw json.RawMessage,
 		return Response{Status: "error", RequestID: reqID, Reason: reason}
 	}
 	if err := d.record(reqID, "execute_fee_set", raw, "accepted", ""); err != nil {
-		_ = d.limits.RollbackChannelOperation(reservation)
+		_ = d.limits.RollbackFeeSetOperation(reservation)
 		return ledgerFailure(reqID, err)
 	}
 	if err := d.executor.ExecuteFeeSet(context.Background(), executor.FeeSetRequest{
 		ChanID: p.ChanID, BaseMsat: p.BaseMsat, FeePpm: p.FeePpm,
 	}); err != nil {
 		reason := err.Error()
-		if rollbackErr := d.limits.RollbackChannelOperation(reservation); rollbackErr != nil {
+		if rollbackErr := d.limits.RollbackFeeSetOperation(reservation); rollbackErr != nil {
 			reason = reason + "; limits rollback failed: " + rollbackErr.Error()
 		}
 		if recErr := d.record(reqID, "execute_fee_set", raw, "failed",
@@ -949,7 +990,7 @@ func (d *Daemon) executeFeeSet(reqID string, raw json.RawMessage,
 		}
 		return Response{Status: "error", RequestID: reqID, Reason: reason}
 	}
-	if err := d.limits.RecordChannelOperation(p.ChanID); err != nil {
+	if err := d.limits.RecordFeeSetOperation(p.ChanID); err != nil {
 		reason := "limits state refresh failed: " + err.Error()
 		if recErr := d.record(reqID, "execute_fee_set", raw, "executed",
 			reason); recErr != nil {

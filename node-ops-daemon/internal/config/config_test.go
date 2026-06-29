@@ -27,6 +27,9 @@ max_fee_ppm_delta = 42
 	if cfg.Limits.MaxFeePpmDelta != 42 {
 		t.Fatalf("expected configured ppm delta, got %d", cfg.Limits.MaxFeePpmDelta)
 	}
+	if cfg.Limits.DailyFeePpmBudget == 0 {
+		t.Fatalf("partial config should preserve daily fee ppm budget default")
+	}
 	if !cfg.Approval.RequireApproval {
 		t.Fatalf("partial config should preserve require_approval default")
 	}
@@ -115,6 +118,7 @@ tls_cert = "~/.lnd/custom-tls.cert"
 
 [operator]
 approval_socket = "~/.node-ops/custom-operator.sock"
+approval_token_file = "~/.node-ops/custom-operator.token"
 `), 0600)
 	if err != nil {
 		t.Fatalf("write config: %v", err)
@@ -137,6 +141,10 @@ approval_socket = "~/.node-ops/custom-operator.sock"
 	}
 	if want := filepath.Join(home, ".node-ops", "custom-operator.sock"); cfg.Operator.ApprovalSocket != want {
 		t.Fatalf("operator socket = %q, want %q", cfg.Operator.ApprovalSocket, want)
+	}
+	if want := filepath.Join(home, ".node-ops", "custom-operator.token"); cfg.Operator.ApprovalTokenFile != want {
+		t.Fatalf("operator token file = %q, want %q",
+			cfg.Operator.ApprovalTokenFile, want)
 	}
 }
 
@@ -182,6 +190,22 @@ func TestLoadRejectsEmptyStoragePaths(t *testing.T) {
 				t.Fatalf("expected %q error, got %v", tc.wantErr, err)
 			}
 		})
+	}
+}
+
+func TestLoadRejectsInvalidLimitsConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	err := os.WriteFile(path, []byte(`
+[limits]
+daily_fee_ppm_budget = -1
+`), 0600)
+	if err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, err = Load(path)
+	if err == nil || !strings.Contains(err.Error(), "daily_fee_ppm_budget") {
+		t.Fatalf("expected daily fee budget error, got %v", err)
 	}
 }
 
@@ -254,6 +278,14 @@ request_timeout = "nope"
 approval_socket = " "
 `,
 			wantErr: "operator.approval_socket",
+		},
+		{
+			name: "operator token file",
+			body: `
+[operator]
+approval_token_file = " "
+`,
+			wantErr: "operator.approval_token_file",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

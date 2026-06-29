@@ -97,6 +97,7 @@ graph TD
 
    [operator]
    approval_socket = "~/.node-ops/operator.sock"  # separate human/operator boundary
+   approval_token_file = "~/.node-ops/operator.token"
    ```
 
 6. **Ledger — SQLite** (`modernc.org/sqlite`, pure-Go, no CGO), an **INSERT-only**

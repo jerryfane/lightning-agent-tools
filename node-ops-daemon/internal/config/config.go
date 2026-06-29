@@ -18,8 +18,12 @@ type Limits struct {
 	// DailyRebalanceBudgetSat is the max sats that may be rebalanced per UTC day.
 	DailyRebalanceBudgetSat int64 `toml:"daily_rebalance_budget_sat"`
 
+	// DailyFeePpmBudget is the max cumulative absolute fee-rate delta, in ppm,
+	// that may be executed per UTC day.
+	DailyFeePpmBudget int64 `toml:"daily_fee_ppm_budget"`
+
 	// MaxFeePpmDelta is the largest single fee change (absolute, in ppm) the
-	// daemon may auto-execute.
+	// daemon may execute.
 	MaxFeePpmDelta int64 `toml:"max_fee_ppm_delta"`
 
 	// PerChannelCooldown is a Go duration string (e.g. "1h") enforcing a
@@ -30,14 +34,14 @@ type Limits struct {
 	RebalanceMaxFeePpm int64 `toml:"rebalance_max_fee_ppm"`
 }
 
-// Approval decides whether requests are auto-executed or queued.
+// Approval controls pending-queue policy for money-affecting actions.
 type Approval struct {
-	// AutoExecuteBelowPpmDelta: if |delta| <= this value and RequireApproval
-	// is false, the daemon executes immediately without human review.
+	// AutoExecuteBelowPpmDelta is reserved for future action types. Fee-set
+	// execution always requires operator approval.
 	AutoExecuteBelowPpmDelta int64 `toml:"auto_execute_below_ppm_delta"`
 
-	// RequireApproval forces every action into the pending queue regardless
-	// of size.
+	// RequireApproval forces supported actions into the pending queue regardless
+	// of size. Fee-set execution is always queued.
 	RequireApproval bool `toml:"require_approval"`
 }
 
@@ -78,6 +82,10 @@ type Node struct {
 type Operator struct {
 	// ApprovalSocket is the separate local socket for approve/deny actions.
 	ApprovalSocket string `toml:"approval_socket"`
+
+	// ApprovalTokenFile is a human/operator-only token required on the
+	// operator socket before approve/deny actions are accepted.
+	ApprovalTokenFile string `toml:"approval_token_file"`
 }
 
 // Monitor controls background read-only node health polling and alert output.
@@ -121,6 +129,7 @@ func Defaults() *Config {
 	return &Config{
 		Limits: Limits{
 			DailyRebalanceBudgetSat: 1_000_000,
+			DailyFeePpmBudget:       500,
 			MaxFeePpmDelta:          100,
 			PerChannelCooldown:      "1h",
 			RebalanceMaxFeePpm:      500,
@@ -143,7 +152,8 @@ func Defaults() *Config {
 			RequestTimeout:  "10s",
 		},
 		Operator: Operator{
-			ApprovalSocket: filepath.Join(base, "operator.sock"),
+			ApprovalSocket:    filepath.Join(base, "operator.sock"),
+			ApprovalTokenFile: filepath.Join(base, "operator.token"),
 		},
 		Monitor: Monitor{
 			Enabled:       false,
@@ -182,6 +192,7 @@ func (c *Config) expand() error {
 	c.Node.MacaroonPath = expandHome(c.Node.MacaroonPath, home)
 	c.Node.TLSCertPath = expandHome(c.Node.TLSCertPath, home)
 	c.Operator.ApprovalSocket = expandHome(c.Operator.ApprovalSocket, home)
+	c.Operator.ApprovalTokenFile = expandHome(c.Operator.ApprovalTokenFile, home)
 	c.Monitor.AlertPath = expandHome(c.Monitor.AlertPath, home)
 	return nil
 }
@@ -195,6 +206,9 @@ func (c *Config) validate() error {
 	}
 	if strings.TrimSpace(c.Storage.KillswitchFile) == "" {
 		return fmt.Errorf("storage.killswitch must not be empty")
+	}
+	if c.Limits.DailyFeePpmBudget < 0 {
+		return fmt.Errorf("limits.daily_fee_ppm_budget must be non-negative")
 	}
 	if strings.TrimSpace(c.Node.LndRPC) == "" {
 		return fmt.Errorf("node.lnd_rpc must not be empty")
@@ -219,6 +233,9 @@ func (c *Config) validate() error {
 	}
 	if strings.TrimSpace(c.Operator.ApprovalSocket) == "" {
 		return fmt.Errorf("operator.approval_socket must not be empty")
+	}
+	if strings.TrimSpace(c.Operator.ApprovalTokenFile) == "" {
+		return fmt.Errorf("operator.approval_token_file must not be empty")
 	}
 	if err := validateDuration("monitor.poll_interval", c.Monitor.PollInterval, true); err != nil {
 		return err
