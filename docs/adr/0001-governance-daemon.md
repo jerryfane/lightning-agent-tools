@@ -4,6 +4,10 @@
 - **Date:** 2026-06-25
 - **Issue:** #2 (blocks #8, #9, #10, #11, #12)
 
+Related docs: [Architecture](../architecture.md#authority-boundaries),
+[Security](../security.md#non-negotiable-boundaries),
+[MCP Server](../mcp-server.md#node-ops-request-lifecycle).
+
 ## Context
 
 The node-ops thesis is **bounded execution**: every existing tool is either
@@ -120,6 +124,22 @@ graph TD
    (or a `--stop` daemon flag) makes the daemon reject every execution request
    immediately, regardless of limits or approvals. `node-ops stop` / `node-ops resume`
    toggle it.
+
+### Current implementation notes
+
+The repository now has the sidecar daemon and thin MCP clients described here.
+`lnc_execute_fee_set` and `lnc_execute_rebalance` submit requests over the
+daemon Unix socket; `lnc_query_node_ops_audit` reads the daemon audit ledger.
+The MCP server does not load the `node-ops` macaroon or the operator approval
+token.
+
+Gated writes are code-enforced `regtest` only in the current implementation:
+config validation and the LND executor reject any `required_network` other than
+`regtest`. Fee-set and rebalance execution are queued for human review
+regardless of size, and the `auto_execute_below_ppm_delta` knob is reserved for
+future action types. That means the implemented approval model is stricter than
+the early sketch above: every current money-affecting execute request must pass
+the operator boundary before the daemon writes to LND.
 
 ## Consequences
 

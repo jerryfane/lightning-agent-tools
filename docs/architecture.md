@@ -14,6 +14,18 @@ together.
 
 ## Component Overview
 
+The recommended reading path is:
+
+1. Start here to understand the component map and credential boundaries.
+2. Read [Security](security.md) before giving an agent any macaroon, pairing
+   phrase, or wallet access.
+3. Read [MCP Server](mcp-server.md) for the read-only LNC tools and the
+   daemon-gated node-ops request path.
+4. Read [L402 and lnget](l402-and-lnget.md) and [Commerce](commerce.md) for
+   buyer/seller payment flows.
+5. Read [Two-Agent Secure Setup](two-agent-setup.md) when private keys should
+   stay on a signer machine that is separate from the agent machine.
+
 The kit has three layers: the Claude Code plugin interface, the skills that
 manage infrastructure, and the daemons and tools those skills operate.
 
@@ -84,6 +96,26 @@ rebalance workflows. It uses the local `node-ops-daemon` boundary so the MCP
 server can submit requests without receiving LND write credentials; the daemon
 holds the scoped macaroon, enforces limits, requires operator approval, and
 writes the audit ledger.
+
+## Authority Boundaries
+
+The important architectural split is not "agent versus non-agent"; it is which
+component holds credentials and which component is allowed to mutate node state.
+
+| Surface | Credential in that process | Node effect | Approval boundary |
+|---------|----------------------------|-------------|-------------------|
+| `lnget` buyer flow | A Lightning backend credential such as a `pay-only` macaroon, LNC pairing, or neutrino wallet | Pays L402 invoices within the command/configured spend limit | The buyer command's `--max-cost` or config limit; no node-ops approval queue |
+| `aperture` seller flow | Seller-side invoice credential, normally `invoice-only` | Creates and settles invoices for protected HTTP paths | Seller operator controls pricing/configuration |
+| LNC-backed MCP read tools | In-memory LNC pairing session; no macaroon written by the MCP server | Reads balances, channels, invoices, payments, graph, and health data | None; these are read-only queries |
+| MCP proposal tools | Same LNC read session | Produces fee, rebalance, health, and channel-action recommendations only | None; proposals do not write to LND |
+| MCP execute tools | No LND write credential; a local Unix-socket client to `node-ops-daemon` | Submits fee-set or circular-rebalance requests | Daemon limits, kill-switch, audit ledger, and separate operator approval |
+| `node-ops-daemon` | Scoped `node-ops` macaroon and TLS cert | Applies approved fee-set and rebalance operations | Human/operator socket and token; not exposed to the MCP host |
+
+The MCP server is therefore safe to treat as a model-callable interface only
+because write authority is physically elsewhere. It can observe the node through
+LNC and can ask the daemon to queue a bounded operation, but it cannot bypass
+the daemon, hold the daemon's macaroon, approve its own request, or ignore the
+audit ledger.
 
 ## Plugin Discovery
 
@@ -267,7 +299,7 @@ unrestricted access to every RPC method, which is why you should never hand it
 to an agent in production.
 
 The `macaroon-bakery` skill bakes scoped macaroons that grant only the
-permissions an agent needs. It ships with five preset roles:
+permissions an agent needs. It ships with six preset roles:
 
 | Role | Can do | Cannot do |
 |------|--------|-----------|
@@ -276,6 +308,7 @@ permissions an agent needs. It ships with five preset roles:
 | `read-only` | Query balances, channels, peers, payments | Modify any state |
 | `channel-admin` | Everything in read-only + open/close channels | Pay or create invoices |
 | `signer-only` | Sign transactions, derive keys | Everything else |
+| `node-ops` | Update channel policy, build/query routes, and use route-send for daemon-checked rebalances | Open/close channels, create invoices, or use high-level payment RPCs |
 
 Custom macaroons can be baked with arbitrary permission sets by passing
 individual URI permissions to `bake.sh --custom`. The full list of available
@@ -342,8 +375,10 @@ The server exposes LNC-backed read tools organized into categories such as
 Connection, Node, Channels, Invoices, Payments, Peers/Network, and On-Chain.
 Those tools query balances, list channels, decode invoices, and inspect the
 network graph without modifying node state. Daemon-gated node-ops tools are
-separate local socket clients; see [MCP Server](mcp-server.md) for the full tool
-reference.
+separate local socket clients: they submit requests to `node-ops-daemon`, which
+holds the scoped `node-ops` macaroon, persists limits state, records every
+request in SQLite, and requires the operator approval boundary before execution.
+See [MCP Server](mcp-server.md) for the full tool reference.
 
 Internally, the server uses a service manager
 (`lightning-mcp-server/internal/services/manager.go`) that initializes one service per

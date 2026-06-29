@@ -46,6 +46,21 @@ The credentials bundle contains three files:
 No private keys cross the wire. The bundle contains only public keys and
 authentication material.
 
+## Roles and Approval Boundaries
+
+A production deployment usually has three distinct authority surfaces:
+
+| Role | Runs where | Holds | Must not hold |
+|------|------------|-------|---------------|
+| Signer agent | Secure signer machine | Wallet seed, private keys, signer wallet passphrase, signer macaroons | Node agent wallet files or operator approval token |
+| Node agent | Agent-facing machine | Watch-only wallet state, signer TLS cert, scoped signer macaroon, task-specific node macaroons | Wallet seed or private keys |
+| Human/operator | Operator shell or service account | `~/.node-ops/operator.token` and access to the operator approval socket | Model-callable MCP session credentials |
+
+The node agent can submit read-only MCP queries and, when configured, daemon
+requests for fee-set or rebalance work. It should not be able to approve those
+requests itself. Approval happens through the operator boundary, which is
+separate from both the LNC pairing session and the MCP server process.
+
 ## Container Mode (Recommended)
 
 Docker is the default deployment method. All scripts auto-detect containers
@@ -370,6 +385,12 @@ skills/lightning-security-module/scripts/export-credentials.sh --native
 
 # Then transfer the new bundle to the node agent and re-import
 ```
+
+If the node agent uses `lnc_execute_fee_set` or `lnc_execute_rebalance`, the
+expected result from the model-callable MCP tool is a daemon response such as
+`pending` with a `request_id`, not unilateral execution. A human/operator then
+approves or denies that request from the separate operator socket. This keeps
+the signer boundary, node write boundary, and approval boundary independent.
 
 ## Credential Scoping for the Node Agent
 

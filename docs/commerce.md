@@ -54,6 +54,24 @@ From the seller's perspective, aperture handles everything: invoice
 generation, challenge issuance, token validation, and request proxying. The
 backend service just serves HTTP requests.
 
+## Commerce Security Model
+
+Agent commerce uses ordinary Lightning payments, not the node-ops approval
+queue. The buyer decides whether to pay by setting a per-request ceiling, and
+the seller decides what a protected path costs in aperture configuration.
+
+| Side | Agent capability | Recommended credential | Main guardrail |
+|------|------------------|------------------------|----------------|
+| Buyer | Fetch paid HTTP resources with `lnget` | `pay-only` macaroon or LNC/neutrino backend | `--max-cost`, preview mode, and balance monitoring |
+| Seller | Generate invoices for aperture-protected paths | `invoice-only` macaroon | Explicit aperture price and path configuration |
+| Backend | Serve data after aperture authenticates the token | None | Keep it behind aperture for paid paths |
+
+Human/operator approval is required for the node-ops fee-set and rebalance
+workflow, not for every L402 purchase. For autonomous buyers, use small
+defaults, preview unknown prices with `--no-pay`, and route production funds
+through the remote-signer architecture described in
+[Security](security.md#tier-1-watch-only-with-remote-signer).
+
 ## Buyer Agent Setup
 
 A buyer agent needs two components: an `lnd` node for payments and `lnget` for
