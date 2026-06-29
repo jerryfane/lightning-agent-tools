@@ -6,12 +6,14 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/config"
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/executor"
@@ -47,8 +49,9 @@ func newTestDaemonWithExecutor(t *testing.T, mutate func(*config.Config),
 			RequireApproval:          true,
 		},
 		Storage: config.Storage{
-			LedgerPath:     filepath.Join(storeDir, "ledger.db"),
-			KillswitchFile: filepath.Join(storeDir, "STOP"),
+			LedgerPath:      filepath.Join(storeDir, "ledger.db"),
+			LimitsStatePath: filepath.Join(storeDir, "limits-state.json"),
+			KillswitchFile:  filepath.Join(storeDir, "STOP"),
 		},
 	}
 	if mutate != nil {
@@ -64,10 +67,12 @@ func newTestDaemonWithExecutor(t *testing.T, mutate func(*config.Config),
 }
 
 type fakeExecutor struct {
-	mu        sync.Mutex
-	current   map[uint64]executor.FeePolicy
-	executed  []executor.FeeSetRequest
-	onCurrent func()
+	mu         sync.Mutex
+	current    map[uint64]executor.FeePolicy
+	executed   []executor.FeeSetRequest
+	onCurrent  func()
+	onExecute  func()
+	executeErr error
 }
 
 func newFakeExecutor(current map[uint64]executor.FeePolicy) *fakeExecutor {
@@ -93,6 +98,12 @@ func (f *fakeExecutor) ExecuteFeeSet(_ context.Context,
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.executeErr != nil {
+		return f.executeErr
+	}
+	if f.onExecute != nil {
+		f.onExecute()
+	}
 	f.executed = append(f.executed, req)
 	f.current[req.ChanID] = executor.FeePolicy{
 		BaseMsat: req.BaseMsat,
@@ -166,6 +177,223 @@ func TestDispatchAutoExecuteAppliesCooldown(t *testing.T) {
 	})
 	if second.Status != "error" || !strings.Contains(second.Reason, "cooldown") {
 		t.Fatalf("expected cooldown rejection, got %+v", second)
+	}
+}
+
+func TestDispatchCooldownSurvivesDaemonRestart(t *testing.T) {
+	storeDir := filepath.Join(t.TempDir(), "node-ops")
+	if err := os.Mkdir(storeDir, 0700); err != nil {
+		t.Fatalf("Mkdir store dir: %v", err)
+	}
+	cfg := &config.Config{
+		Limits: config.Limits{
+			DailyRebalanceBudgetSat: 1_000,
+			MaxFeePpmDelta:          100,
+			PerChannelCooldown:      "1h",
+			RebalanceMaxFeePpm:      500,
+		},
+		Approval: config.Approval{
+			AutoExecuteBelowPpmDelta: 25,
+			RequireApproval:          false,
+		},
+		Storage: config.Storage{
+			LedgerPath:      filepath.Join(storeDir, "ledger.db"),
+			LimitsStatePath: filepath.Join(storeDir, "limits-state.json"),
+			KillswitchFile:  filepath.Join(storeDir, "STOP"),
+		},
+	}
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{
+		1: {BaseMsat: 1_000, FeePpm: 100},
+	})
+
+	firstDaemon, err := New(cfg, fake)
+	if err != nil {
+		t.Fatalf("New first daemon: %v", err)
+	}
+	first := firstDaemon.dispatch(Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"fee_ppm":110}`),
+	})
+	if first.Status != "ok" {
+		t.Fatalf("expected first request to execute, got %+v", first)
+	}
+	if err := firstDaemon.Close(); err != nil {
+		t.Fatalf("Close first daemon: %v", err)
+	}
+
+	restarted, err := New(cfg, fake)
+	if err != nil {
+		t.Fatalf("New restarted daemon: %v", err)
+	}
+	t.Cleanup(func() { _ = restarted.Close() })
+	second := restarted.dispatch(Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"fee_ppm":120}`),
+	})
+	if second.Status != "error" || !strings.Contains(second.Reason, "cooldown") {
+		t.Fatalf("expected persisted cooldown rejection, got %+v", second)
+	}
+	if len(fake.executed) != 1 {
+		t.Fatalf("cooldown restart check should not execute again: %+v", fake.executed)
+	}
+}
+
+func TestDispatchPersistsCooldownBeforeExecutorWrite(t *testing.T) {
+	storeDir := filepath.Join(t.TempDir(), "node-ops")
+	if err := os.Mkdir(storeDir, 0700); err != nil {
+		t.Fatalf("Mkdir store dir: %v", err)
+	}
+	cfg := &config.Config{
+		Limits: config.Limits{
+			DailyRebalanceBudgetSat: 1_000,
+			MaxFeePpmDelta:          100,
+			PerChannelCooldown:      "1h",
+			RebalanceMaxFeePpm:      500,
+		},
+		Approval: config.Approval{
+			AutoExecuteBelowPpmDelta: 25,
+			RequireApproval:          false,
+		},
+		Storage: config.Storage{
+			LedgerPath:      filepath.Join(storeDir, "ledger.db"),
+			LimitsStatePath: filepath.Join(storeDir, "limits-state.json"),
+			KillswitchFile:  filepath.Join(storeDir, "STOP"),
+		},
+	}
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{
+		1: {BaseMsat: 1_000, FeePpm: 100},
+	})
+	fake.onExecute = func() {
+		body, err := os.ReadFile(cfg.Storage.LimitsStatePath)
+		if err != nil {
+			t.Fatalf("ReadFile limits state during execute: %v", err)
+		}
+		if !strings.Contains(string(body), `"1":`) {
+			t.Fatalf("limits state did not reserve channel before write: %s", body)
+		}
+	}
+
+	d, err := New(cfg, fake)
+	if err != nil {
+		t.Fatalf("New daemon: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	resp := d.dispatch(Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"fee_ppm":110}`),
+	})
+	if resp.Status != "ok" {
+		t.Fatalf("expected execution to succeed, got %+v", resp)
+	}
+}
+
+func TestDispatchRefreshesCooldownAfterExecutorWrite(t *testing.T) {
+	storeDir := filepath.Join(t.TempDir(), "node-ops")
+	if err := os.Mkdir(storeDir, 0700); err != nil {
+		t.Fatalf("Mkdir store dir: %v", err)
+	}
+	cfg := &config.Config{
+		Limits: config.Limits{
+			DailyRebalanceBudgetSat: 1_000,
+			MaxFeePpmDelta:          100,
+			PerChannelCooldown:      "200ms",
+			RebalanceMaxFeePpm:      500,
+		},
+		Approval: config.Approval{
+			AutoExecuteBelowPpmDelta: 25,
+			RequireApproval:          false,
+		},
+		Storage: config.Storage{
+			LedgerPath:      filepath.Join(storeDir, "ledger.db"),
+			LimitsStatePath: filepath.Join(storeDir, "limits-state.json"),
+			KillswitchFile:  filepath.Join(storeDir, "STOP"),
+		},
+	}
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{
+		1: {BaseMsat: 1_000, FeePpm: 100},
+	})
+	fake.onExecute = func() {
+		time.Sleep(250 * time.Millisecond)
+	}
+
+	d, err := New(cfg, fake)
+	if err != nil {
+		t.Fatalf("New daemon: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	first := d.dispatch(Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"fee_ppm":110}`),
+	})
+	if first.Status != "ok" {
+		t.Fatalf("expected first execution to succeed, got %+v", first)
+	}
+	second := d.dispatch(Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"fee_ppm":120}`),
+	})
+	if second.Status != "error" || !strings.Contains(second.Reason, "cooldown") {
+		t.Fatalf("expected refreshed cooldown rejection, got %+v", second)
+	}
+}
+
+func TestDispatchExecutorFailureDoesNotPersistCooldown(t *testing.T) {
+	storeDir := filepath.Join(t.TempDir(), "node-ops")
+	if err := os.Mkdir(storeDir, 0700); err != nil {
+		t.Fatalf("Mkdir store dir: %v", err)
+	}
+	cfg := &config.Config{
+		Limits: config.Limits{
+			DailyRebalanceBudgetSat: 1_000,
+			MaxFeePpmDelta:          100,
+			PerChannelCooldown:      "1h",
+			RebalanceMaxFeePpm:      500,
+		},
+		Approval: config.Approval{
+			AutoExecuteBelowPpmDelta: 25,
+			RequireApproval:          false,
+		},
+		Storage: config.Storage{
+			LedgerPath:      filepath.Join(storeDir, "ledger.db"),
+			LimitsStatePath: filepath.Join(storeDir, "limits-state.json"),
+			KillswitchFile:  filepath.Join(storeDir, "STOP"),
+		},
+	}
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{
+		1: {BaseMsat: 1_000, FeePpm: 100},
+	})
+	fake.executeErr = errors.New("lnd rejected update")
+
+	firstDaemon, err := New(cfg, fake)
+	if err != nil {
+		t.Fatalf("New first daemon: %v", err)
+	}
+	failed := firstDaemon.dispatch(Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"fee_ppm":110}`),
+	})
+	if failed.Status != "error" || !strings.Contains(failed.Reason, "lnd rejected") {
+		t.Fatalf("expected executor failure, got %+v", failed)
+	}
+	if err := firstDaemon.Close(); err != nil {
+		t.Fatalf("Close first daemon: %v", err)
+	}
+
+	fake.executeErr = nil
+	restarted, err := New(cfg, fake)
+	if err != nil {
+		t.Fatalf("New restarted daemon: %v", err)
+	}
+	t.Cleanup(func() { _ = restarted.Close() })
+	second := restarted.dispatch(Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"fee_ppm":110}`),
+	})
+	if second.Status != "ok" {
+		t.Fatalf("failed execution should not persist cooldown, got %+v", second)
+	}
+	if len(fake.executed) != 1 {
+		t.Fatalf("expected one successful execution after restart, got %+v", fake.executed)
 	}
 }
 
@@ -346,6 +574,7 @@ func TestNewRejectsUnsafeExistingLedgerDirectory(t *testing.T) {
 
 	cfg := config.Defaults()
 	cfg.Storage.LedgerPath = filepath.Join(dir, "ledger.db")
+	cfg.Storage.LimitsStatePath = filepath.Join(t.TempDir(), "limits-state.json")
 	cfg.Storage.KillswitchFile = filepath.Join(t.TempDir(), "STOP")
 	d, err := New(cfg, newFakeExecutor(nil))
 	if err == nil {
@@ -441,6 +670,58 @@ func TestDispatchKillSwitchHaltsAndLogs(t *testing.T) {
 		entries[0].Reason != "killswitch active" {
 
 		t.Fatalf("unexpected ledger entries: %+v", entries)
+	}
+}
+
+func TestDispatchKillSwitchSurvivesDaemonRestart(t *testing.T) {
+	storeDir := filepath.Join(t.TempDir(), "node-ops")
+	if err := os.Mkdir(storeDir, 0700); err != nil {
+		t.Fatalf("Mkdir store dir: %v", err)
+	}
+	cfg := &config.Config{
+		Limits: config.Limits{
+			DailyRebalanceBudgetSat: 1_000,
+			MaxFeePpmDelta:          100,
+			PerChannelCooldown:      "0s",
+			RebalanceMaxFeePpm:      500,
+		},
+		Approval: config.Approval{
+			AutoExecuteBelowPpmDelta: 25,
+			RequireApproval:          false,
+		},
+		Storage: config.Storage{
+			LedgerPath:      filepath.Join(storeDir, "ledger.db"),
+			LimitsStatePath: filepath.Join(storeDir, "limits-state.json"),
+			KillswitchFile:  filepath.Join(storeDir, "STOP"),
+		},
+	}
+
+	firstDaemon, err := New(cfg, newFakeExecutor(map[uint64]executor.FeePolicy{
+		1: {BaseMsat: 1_000, FeePpm: 100},
+	}))
+	if err != nil {
+		t.Fatalf("New first daemon: %v", err)
+	}
+	if err := firstDaemon.Close(); err != nil {
+		t.Fatalf("Close first daemon: %v", err)
+	}
+	if err := os.WriteFile(cfg.Storage.KillswitchFile, []byte("stop"), 0600); err != nil {
+		t.Fatalf("write killswitch: %v", err)
+	}
+
+	restarted, err := New(cfg, newFakeExecutor(map[uint64]executor.FeePolicy{
+		1: {BaseMsat: 1_000, FeePpm: 100},
+	}))
+	if err != nil {
+		t.Fatalf("New restarted daemon: %v", err)
+	}
+	t.Cleanup(func() { _ = restarted.Close() })
+	resp := restarted.dispatch(Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"fee_ppm":110}`),
+	})
+	if resp.Status != "error" || !strings.Contains(resp.Reason, "killswitch") {
+		t.Fatalf("expected persisted killswitch rejection, got %+v", resp)
 	}
 }
 

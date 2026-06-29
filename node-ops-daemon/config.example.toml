@@ -25,5 +25,8 @@ require_approval = true
 # Path to the append-only SQLite audit ledger.
 ledger = "~/.node-ops/ledger.db"
 
+# Path to the persisted limits engine state.
+limits_state = "~/.node-ops/limits-state.json"
+
 # Creating this file halts all daemon execution immediately.
 killswitch = "~/.node-ops/STOP"

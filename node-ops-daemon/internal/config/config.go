@@ -45,6 +45,9 @@ type Storage struct {
 	// LedgerPath is the path to the SQLite audit ledger.
 	LedgerPath string `toml:"ledger"`
 
+	// LimitsStatePath is the path to the persisted limits engine state.
+	LimitsStatePath string `toml:"limits_state"`
+
 	// KillswitchFile is the path whose mere presence halts all execution.
 	KillswitchFile string `toml:"killswitch"`
 }
@@ -78,8 +81,9 @@ func Defaults() *Config {
 			RequireApproval:          true,
 		},
 		Storage: Storage{
-			LedgerPath:     filepath.Join(base, "ledger.db"),
-			KillswitchFile: filepath.Join(base, "STOP"),
+			LedgerPath:      filepath.Join(base, "ledger.db"),
+			LimitsStatePath: filepath.Join(base, "limits-state.json"),
+			KillswitchFile:  filepath.Join(base, "STOP"),
 		},
 	}
 }
@@ -106,6 +110,7 @@ func (c *Config) expand() error {
 		return err
 	}
 	c.Storage.LedgerPath = expandHome(c.Storage.LedgerPath, home)
+	c.Storage.LimitsStatePath = expandHome(c.Storage.LimitsStatePath, home)
 	c.Storage.KillswitchFile = expandHome(c.Storage.KillswitchFile, home)
 	return nil
 }
@@ -113,6 +118,9 @@ func (c *Config) expand() error {
 func (c *Config) validate() error {
 	if strings.TrimSpace(c.Storage.LedgerPath) == "" {
 		return fmt.Errorf("storage.ledger must not be empty")
+	}
+	if strings.TrimSpace(c.Storage.LimitsStatePath) == "" {
+		return fmt.Errorf("storage.limits_state must not be empty")
 	}
 	if strings.TrimSpace(c.Storage.KillswitchFile) == "" {
 		return fmt.Errorf("storage.killswitch must not be empty")
