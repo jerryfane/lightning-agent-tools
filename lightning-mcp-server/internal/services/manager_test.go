@@ -36,6 +36,7 @@ func TestManager_Creation(t *testing.T) {
 	manager.InitializeServices()
 	assert.NotNil(t, manager.invoiceService)
 	assert.NotNil(t, manager.connectionService)
+	assert.NotNil(t, manager.nodeOpsAuditService)
 }
 
 // Test RegisterTools with valid MCP server.
@@ -59,6 +60,7 @@ func TestManager_RegisterTools(t *testing.T) {
 	assert.Contains(t, names, "lnc_decode_invoice")
 	assert.Contains(t, names, "lnc_list_channels")
 	assert.Contains(t, names, "lnc_list_unspent")
+	assert.Contains(t, names, "lnc_query_node_ops_audit")
 	assert.NotZero(t, len(stub.tools))
 }
 
@@ -95,6 +97,7 @@ func TestManager_RegisterTools_ReadOnlyMode(t *testing.T) {
 	assert.Contains(t, names, "lnc_list_unspent")
 	assert.Contains(t, names, "lnc_decode_invoice")
 	assert.Contains(t, names, "lnc_list_peers")
+	assert.Contains(t, names, "lnc_query_node_ops_audit")
 	assert.Len(t, stub.tools, len(names))
 }
 
@@ -178,6 +181,7 @@ func TestManager_ServiceIntegration(t *testing.T) {
 	assert.NotNil(t, manager.onchainService)
 	assert.NotNil(t, manager.peerService)
 	assert.NotNil(t, manager.nodeService)
+	assert.NotNil(t, manager.nodeOpsAuditService)
 
 	// Test that read-only tools can be created
 	decodeInvoiceTool := manager.invoiceService.DecodeInvoiceTool()

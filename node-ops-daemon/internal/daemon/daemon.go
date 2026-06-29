@@ -17,6 +17,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +32,12 @@ import (
 )
 
 const maxMessageBytes = 1 << 20 // 1 MiB
+
+const (
+	defaultAuditQueryLimit = 50
+	maxAuditQueryLimit     = 500
+	maxAuditParamBytes     = 4096
+)
 
 // Request is the incoming message from a client.
 type Request struct {
@@ -217,6 +224,8 @@ func (d *Daemon) dispatch(req Request) Response {
 	switch req.Action {
 	case "execute_fee_set":
 		return d.handleFeeSet(reqID, req.Params)
+	case "query_audit_log":
+		return d.handleQueryAuditLog(reqID, req.Params)
 	case "list_pending":
 		return d.handleListPending(reqID)
 	case "status":
@@ -260,6 +269,127 @@ func ledgerFailure(reqID string, err error) Response {
 		RequestID: reqID,
 		Reason:    "audit ledger unavailable: " + err.Error(),
 	}
+}
+
+type auditQueryParams struct {
+	RequestID   string `json:"request_id"`
+	Action      string `json:"action"`
+	Status      string `json:"status"`
+	Limit       *int   `json:"limit"`
+	Offset      *int   `json:"offset"`
+	NewestFirst *bool  `json:"newest_first"`
+}
+
+type auditQueryResult struct {
+	Count   int                `json:"count"`
+	Limit   int                `json:"limit"`
+	Offset  int                `json:"offset"`
+	Entries []auditEntryResult `json:"entries"`
+}
+
+type auditEntryResult struct {
+	ID              int64           `json:"id"`
+	RequestID       string          `json:"request_id"`
+	Action          string          `json:"action"`
+	Params          json.RawMessage `json:"params,omitempty"`
+	ParamsPreview   string          `json:"params_preview,omitempty"`
+	ParamsTruncated bool            `json:"params_truncated,omitempty"`
+	Status          string          `json:"status"`
+	Reason          string          `json:"reason"`
+	CreatedAt       string          `json:"created_at"`
+}
+
+func (d *Daemon) handleQueryAuditLog(reqID string, raw json.RawMessage) Response {
+	params, err := parseAuditQueryParams(raw)
+	if err != nil {
+		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
+	}
+
+	entries, err := d.ledger.Query(ledger.QueryOptions{
+		RequestID:   params.RequestID,
+		Action:      params.Action,
+		Status:      params.Status,
+		Limit:       *params.Limit,
+		Offset:      *params.Offset,
+		NewestFirst: *params.NewestFirst,
+	})
+	if err != nil {
+		return ledgerFailure(reqID, err)
+	}
+
+	result := auditQueryResult{
+		Count:   len(entries),
+		Limit:   *params.Limit,
+		Offset:  *params.Offset,
+		Entries: make([]auditEntryResult, len(entries)),
+	}
+	for i, entry := range entries {
+		result.Entries[i] = auditEntryFromLedger(entry)
+	}
+	return Response{Status: "ok", RequestID: reqID, Result: result}
+}
+
+func parseAuditQueryParams(raw json.RawMessage) (auditQueryParams, error) {
+	limit := defaultAuditQueryLimit
+	offset := 0
+	newestFirst := true
+	params := auditQueryParams{
+		Limit:       &limit,
+		Offset:      &offset,
+		NewestFirst: &newestFirst,
+	}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &params); err != nil {
+			return auditQueryParams{}, fmt.Errorf("invalid audit query params: %w", err)
+		}
+	}
+	if params.Limit == nil {
+		params.Limit = &limit
+	}
+	if *params.Limit < 1 || *params.Limit > maxAuditQueryLimit {
+		return auditQueryParams{}, fmt.Errorf("limit must be between 1 and %d", maxAuditQueryLimit)
+	}
+	if params.Offset == nil {
+		params.Offset = &offset
+	}
+	if *params.Offset < 0 {
+		return auditQueryParams{}, fmt.Errorf("offset must be non-negative")
+	}
+	if params.NewestFirst == nil {
+		params.NewestFirst = &newestFirst
+	}
+	params.RequestID = strings.TrimSpace(params.RequestID)
+	params.Action = strings.TrimSpace(params.Action)
+	params.Status = strings.TrimSpace(params.Status)
+	return params, nil
+}
+
+func auditEntryFromLedger(entry ledger.Entry) auditEntryResult {
+	params := strings.TrimSpace(entry.Params)
+	if params == "" {
+		params = "{}"
+	}
+
+	result := auditEntryResult{
+		ID:        entry.ID,
+		RequestID: entry.RequestID,
+		Action:    entry.Action,
+		Status:    entry.Status,
+		Reason:    entry.Reason,
+		CreatedAt: entry.CreatedAt.UTC().Format(time.RFC3339),
+	}
+	if len(params) > maxAuditParamBytes {
+		result.ParamsPreview = params[:maxAuditParamBytes]
+		result.ParamsTruncated = true
+		return result
+	}
+	if json.Valid([]byte(params)) {
+		result.Params = json.RawMessage(params)
+		return result
+	}
+	result.ParamsPreview = params
+	result.ParamsTruncated = true
+	return result
 }
 
 func (d *Daemon) statusResult() map[string]string {
