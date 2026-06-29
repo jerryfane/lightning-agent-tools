@@ -1,0 +1,9 @@
+build/
+.docusaurus/
+docs/generated/
+node_modules/
+.cache/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
