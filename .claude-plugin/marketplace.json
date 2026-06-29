@@ -12,7 +12,7 @@
     {
       "name": "lightning-agent-tools",
       "source": ".",
-      "description": "Full Lightning Network agent toolkit with 7 composable skills: lnd node operations, remote signer security, L402 commerce with lnget and Aperture, scoped macaroon credentials, and MCP server integration via Lightning Node Connect.",
+      "description": "Full Lightning Network agent toolkit with 8 composable skills: lnd node operations, remote signer security, L402 commerce with lnget and Aperture, scoped macaroon credentials, MCP server integration via Lightning Node Connect, and bounded node-ops approvals.",
       "version": "0.2.0",
       "author": {
         "name": "Lightning Labs"

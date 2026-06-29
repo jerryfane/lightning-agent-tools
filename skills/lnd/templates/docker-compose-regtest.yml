@@ -52,9 +52,9 @@ services:
       - -zmqpubhashblock=tcp://0.0.0.0:28332
       - -zmqpubhashtx=tcp://0.0.0.0:28333
     ports:
-      - "18443:18443"
-      - "28332:28332"
-      - "28333:28333"
+      - "${BITCOIND_RPC_PORT:-18443}:18443"
+      - "${BITCOIND_ZMQ_BLOCK_PORT:-28332}:28332"
+      - "${BITCOIND_ZMQ_TX_PORT:-28333}:28333"
     volumes:
       - litd-bitcoind-data:/root/.bitcoin
     networks:

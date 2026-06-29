@@ -1,6 +1,6 @@
 {
   "name": "lightning-agent-tools",
-  "description": "Lightning Network agent toolkit. Container-first skills for running Lightning Terminal (litd) nodes with lnd, loop, pool, and tapd. Includes remote signer security, L402 commerce with lnget and Aperture, scoped macaroon credentials, and MCP server integration.",
+  "description": "Lightning Network agent toolkit. Container-first skills for running Lightning Terminal (litd) nodes with lnd, loop, pool, and tapd. Includes remote signer security, L402 commerce with lnget and Aperture, scoped macaroon credentials, MCP server integration, and bounded node-ops approvals.",
   "version": "0.2.0",
   "author": {
     "name": "Lightning Labs"

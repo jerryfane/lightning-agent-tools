@@ -2,14 +2,15 @@
 
 > How Lightning Agent Tools is structured and how its components interact.
 
-Lightning Agent Tools is composed of seven skills and an MCP server. Each skill
+Lightning Agent Tools is composed of eight skills and an MCP server. Each skill
 manages a distinct piece of Lightning infrastructure (running a node, baking
-credentials, fetching paid content, hosting paid endpoints) and they compose
-together to give agents a full-stack payment capability. The skills are shell
-scripts and documentation that work with any agent framework capable of
-executing commands (Claude Code, Codex, or custom tooling). The MCP server
-follows the Model Context Protocol standard and works with any compatible
-client. This document explains how the pieces fit together.
+credentials, fetching paid content, hosting paid endpoints, or routing bounded
+node-ops approvals) and they compose together to give agents a full-stack
+payment capability. The skills are shell scripts and documentation that work
+with any agent framework capable of executing commands (Claude Code, Codex, or
+custom tooling). The MCP server follows the Model Context Protocol standard and
+works with any compatible client. This document explains how the pieces fit
+together.
 
 ## Component Overview
 
@@ -27,6 +28,7 @@ graph TD
         lnget_skill["lnget"]
         ap["aperture"]
         mcp["lightning-mcp-server"]
+        nodeops["node-ops"]
         com["commerce"]
     end
 
@@ -35,6 +37,7 @@ graph TD
         signer["lnd signer<br/>gRPC :10012"]
         aperture_daemon["aperture proxy<br/>HTTP :8081"]
         mcp_server["lightning-mcp-server<br/>stdio"]
+        ops_daemon["node-ops-daemon<br/>local sockets"]
     end
 
     subgraph External["External"]
@@ -49,6 +52,7 @@ graph TD
     lnget_skill --> lnget_cli["lnget CLI"]
     ap --> aperture_daemon
     mcp --> mcp_server
+    nodeops --> ops_daemon
 
     lnd_daemon <-->|"remote signing"| signer
     lnd_daemon <--> ln
@@ -57,6 +61,8 @@ graph TD
     aperture_daemon -->|"proxies to"| backend
     mcp_server <-->|"encrypted WebSocket"| mailbox
     mailbox <-->|"LNC tunnel"| lnd_daemon
+    mcp_server -->|"gated node-ops requests"| ops_daemon
+    ops_daemon -->|"scoped macaroon"| lnd_daemon
 
     com -.->|"orchestrates"| lnd
     com -.->|"orchestrates"| lnget_skill
@@ -72,6 +78,12 @@ container. All container images are pinned in `versions.env`.
 The `commerce` skill is a meta-skill. It doesn't manage any infrastructure
 directly but orchestrates `lnd`, `lnget`, and `aperture` together into buyer
 and seller workflows.
+
+The `node-ops` skill is the operator playbook for bounded fee-set and circular
+rebalance workflows. It uses the local `node-ops-daemon` boundary so the MCP
+server can submit requests without receiving LND write credentials; the daemon
+holds the scoped macaroon, enforces limits, requires operator approval, and
+writes the audit ledger.
 
 ## Plugin Discovery
 
@@ -96,7 +108,8 @@ to each skill's directory under `skills/`:
 ├── lnd → ../../skills/lnd
 ├── lnget → ../../skills/lnget
 ├── macaroon-bakery → ../../skills/macaroon-bakery
-└── lightning-mcp-server → ../../skills/lightning-mcp-server
+├── lightning-mcp-server → ../../skills/lightning-mcp-server
+└── node-ops → ../../skills/node-ops
 ```
 
 Each skill directory contains a `SKILL.md` file with YAML frontmatter declaring
@@ -450,6 +463,6 @@ Regtest mode adds:
 
 | Port | Service | Daemon |
 |------|---------|--------|
-| 18443 | Bitcoin RPC | bitcoind |
-| 28332 | ZMQ block notifications | bitcoind |
-| 28333 | ZMQ tx notifications | bitcoind |
+| 18443 | Bitcoin RPC | bitcoind, override with `BITCOIND_RPC_PORT` |
+| 28332 | ZMQ block notifications | bitcoind, override with `BITCOIND_ZMQ_BLOCK_PORT` |
+| 28333 | ZMQ tx notifications | bitcoind, override with `BITCOIND_ZMQ_TX_PORT` |

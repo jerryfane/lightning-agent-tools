@@ -27,6 +27,7 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LNGET_LND_DIR="${LNGET_LND_DIR:-$HOME/.lnget/lnd}"
 LND_DIR="${LND_DIR:-$HOME/.lnd}"
 NETWORK="testnet"

@@ -28,6 +28,19 @@ cd lightning-mcp-server && go build -o ./lightning-mcp-server .
 
 ## 2. Bring up a regtest stack (litd + bitcoind)
 
+If a local Bitcoin Core or LND process already owns those host ports, override
+the published ports before starting the stack:
+
+```bash
+export BITCOIND_RPC_PORT=19443
+export BITCOIND_ZMQ_BLOCK_PORT=28342
+export BITCOIND_ZMQ_TX_PORT=28343
+export LITD_HTTPS_PORT=18453
+export LND_GRPC_PORT=11009
+export LND_P2P_PORT=19735
+export LND_REST_PORT=18080
+```
+
 ```bash
 skills/lnd/scripts/docker-start.sh --regtest
 # equivalently:
@@ -117,3 +130,4 @@ docker compose -f skills/lnd/templates/docker-compose-regtest.yml --profile two-
 - `skills/lightning-mcp-server/SKILL.md` — MCP server build & configuration
 - `skills/lnc-app/SKILL.md` — Lightning Node Connect pairing details
 - `docs/mcp-server.md` — MCP transport / tool reference
+- `docs/node-ops-regtest-e2e.md` — full gated fee-set/rebalance proof on a disposable regtest stack

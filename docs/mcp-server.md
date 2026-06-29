@@ -142,6 +142,7 @@ The server organizes its tools into these categories:
 |------|-------------|
 | `lnc_list_channels` | All open channels with capacity, local/remote balances, and activity |
 | `lnc_pending_channels` | Channels being opened, closed, or force-closed |
+| `lnc_propose_channel_actions` | Read-only recommendations for channel actions |
 
 ### Invoices
 
@@ -157,6 +158,24 @@ The server organizes its tools into these categories:
 |------|-------------|
 | `lnc_list_payments` | Paginated payment history with status, amounts, and routes |
 | `lnc_track_payment` | Track a specific in-flight or completed payment by hash |
+
+### Health
+
+| Tool | Description |
+|------|-------------|
+| `lnc_node_health` | Read-only health summary and alert signals |
+
+### Fees
+
+| Tool | Description |
+|------|-------------|
+| `lnc_propose_fees` | Read-only fee policy recommendations |
+
+### Rebalance
+
+| Tool | Description |
+|------|-------------|
+| `lnc_propose_rebalance` | Read-only circular rebalance candidates |
 
 ### Peers and Network
 
@@ -193,7 +212,7 @@ different purposes:
 | **Network** | WebSocket via mailbox relay | Direct TCP to gRPC port |
 | **Firewall** | No inbound ports needed | Port 10009 must be reachable |
 | **Capabilities** | Read-only LNC query tools plus daemon-gated node-ops requests | Full node control |
-| **Permissions** | Hardcoded read-only | Configurable via macaroon scope |
+| **Permissions** | Read-only LNC tools plus daemon-gated node-ops approvals | Configurable via macaroon scope |
 | **Setup** | Pairing phrase from Lightning Terminal | Export TLS cert and macaroon files |
 
 **Use MCP-LNC when** the agent needs to observe node state: checking balances,

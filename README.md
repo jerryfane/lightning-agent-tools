@@ -8,12 +8,13 @@ native access to the [Lightning Network](https://lightning.network), a
 decentralized payment protocol capable of instant, high-volume transactions with
 no identity requirements.
 
-The toolkit consists of seven composable skills and an MCP server. Together they
+The toolkit consists of eight composable skills and an MCP server. Together they
 let an agent run a Lightning node, pay for resources on the web using the
 [L402](https://docs.lightning.engineering/the-lightning-network/l402) protocol,
-host its own paid API endpoints, manage scoped credentials, and query node state
-through the Model Context Protocol. The skills work with any agent framework
-that can execute shell commands: [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview),
+host its own paid API endpoints, manage scoped credentials, query node state
+through the Model Context Protocol, and route bounded node operations through a
+human approval daemon. The skills work with any agent framework that can
+execute shell commands: [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview),
 [Codex](https://openai.com/index/codex/), or your own tooling. The MCP server
 follows the [Model Context Protocol](https://modelcontextprotocol.io) standard
 and works with any compatible client. The security model defaults to a remote
@@ -28,7 +29,7 @@ agent's runtime environment.
 claude mcp add --transport stdio lnc -- npx -y @lightninglabs/lightning-mcp-server
 ```
 
-**Full plugin** (all 7 skills via Claude Code):
+**Full plugin** (all 8 skills via Claude Code):
 
 ```bash
 claude plugin marketplace add lightninglabs/lightning-agent-tools
@@ -61,6 +62,7 @@ graph TD
         lg["lnget<br/><i>L402 HTTP client</i>"]
         ap["aperture<br/><i>L402 reverse proxy</i>"]
         mcp["lightning-mcp-server<br/><i>MCP server</i>"]
+        nodeops["node-ops<br/><i>approval playbook</i>"]
         com["commerce<br/><i>buyer/seller workflows</i>"]
     end
 
@@ -70,6 +72,7 @@ graph TD
         aperture_d["aperture proxy"]
         lnget_d["lnget CLI"]
         mcp_d["lightning-mcp-server"]
+        ops_d["node-ops-daemon"]
     end
 
     lnd --> lnd_d
@@ -77,11 +80,14 @@ graph TD
     lg --> lnget_d
     ap --> aperture_d
     mcp --> mcp_d
+    nodeops --> ops_d
 
     lnd_d <-->|"remote signing"| signer_d
     lnget_d -->|"pays invoices"| lnd_d
     aperture_d -->|"generates invoices"| lnd_d
     mcp_d <-->|"LNC tunnel"| lnd_d
+    mcp_d -->|"gated requests"| ops_d
+    ops_d -->|"scoped macaroon"| lnd_d
 
     com -.-> lnd
     com -.-> lg
@@ -103,10 +109,13 @@ L402 reverse proxy that gates access to a backend service behind Lightning
 invoices. The `commerce` skill ties these together into buyer and seller
 workflows.
 
-**Node access.** The `lightning-mcp-server` skill builds and configures an MCP server that
-connects to a Lightning node via Lightning Node Connect (encrypted WebSocket
-tunnels, pairing-phrase auth, no stored credentials). It exposes 18 read-only
-tools for querying node state and works with any MCP-compatible client.
+**Node access and operations.** The `lightning-mcp-server` skill builds and
+configures an MCP server that connects to a Lightning node via Lightning Node
+Connect (encrypted WebSocket tunnels, pairing-phrase auth, no stored
+credentials). It exposes read-only tools for querying node state and
+daemon-gated node-ops request tools. The `node-ops` skill provides the
+operator playbook and local clients for bounded fee-set and rebalance requests
+that require human approval before the daemon can execute them.
 
 ## Quick Start
 
@@ -151,7 +160,7 @@ the network graph. See [MCP Server](docs/mcp-server.md) for details.
 
 ### Option B: Full Plugin with All Skills
 
-Install the complete plugin (all 7 skills + MCP server) via the Claude Code
+Install the complete plugin (all 8 skills + MCP server) via the Claude Code
 plugin marketplace:
 
 ```bash
@@ -171,7 +180,7 @@ claude --plugin-dir ./lightning-agent-tools
 
 This gives Claude Code access to all skills: lnd node management, remote
 signer security, lnget L402 payments, Aperture proxy, macaroon bakery,
-MCP server integration, and commerce workflows.
+MCP server integration, node-ops approval workflows, and commerce workflows.
 
 ### Option C: Read-Only Node Access (from source)
 
@@ -255,6 +264,7 @@ Export credentials from my signer and set up a watch-only node
 | **lnget** | Command-line HTTP client with automatic L402 payment. Pays Lightning invoices on 402 responses, caches tokens, retries. |
 | **aperture** | L402 reverse proxy. Sits in front of a backend service, issues invoices, validates paid tokens, proxies authorized requests. |
 | **lightning-mcp-server** | Builds and configures the MCP server for LNC-based read-only access plus daemon-gated node-ops requests. 24 tools, no stored credentials. |
+| **node-ops** | Runs the bounded operator loop for fee-set and circular rebalance requests through `node-ops-daemon`, approval tokens, limits, and audit logs. |
 | **commerce** | Meta-skill orchestrating lnd + lnget + aperture for end-to-end buyer/seller workflows. |
 
 All scripts support `--container` for Docker-based lnd nodes and `--rpcserver`
@@ -310,7 +320,8 @@ production checklist.
 | [Architecture](docs/architecture.md) | System design, component map, plugin discovery, data flows |
 | [Security](docs/security.md) | Three-tier security model, remote signer, macaroon scoping, production checklist |
 | [L402 and lnget](docs/l402-and-lnget.md) | The L402 protocol, lnget usage, spending controls, token caching |
-| [MCP Server](docs/mcp-server.md) | LNC mechanics, setup walkthrough, 18-tool reference, configuration |
+| [MCP Server](docs/mcp-server.md) | LNC mechanics, setup walkthrough, tool reference, configuration |
+| [Node-Ops Regtest E2E](docs/node-ops-regtest-e2e.md) | Fresh regtest setup for scoped macaroon, daemon, gated fee-set, gated rebalance, and audit proof |
 | [Commerce](docs/commerce.md) | Buyer and seller agent setup, the commerce loop, cost management |
 | [Two-Agent Setup](docs/two-agent-setup.md) | Signer agent + node agent walkthrough for production key isolation |
 | [Quick Reference](docs/quickref.md) | Every command in one place |
