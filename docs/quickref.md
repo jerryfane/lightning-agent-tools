@@ -162,50 +162,35 @@ skills/lightning-mcp-server/scripts/setup-claude-config.sh --scope global    # a
 ## Node Ops
 
 These daemon commands require a source checkout because the published package
-does not ship the `node-ops-daemon` source tree. See the full E2E runbook for a
-fresh Docker regtest setup.
+does not ship the `node-ops-daemon` source tree. The `node-ops` wrapper uses
+`~/.node-ops/config.toml`, `~/.node-ops/daemon.sock`,
+`~/.node-ops/operator.sock`, and `~/.node-ops/operator.token` by default. See
+the full E2E runbook for a fresh Docker regtest setup.
 
 ```bash
 cd node-ops-daemon && make build && cd ..                                  # build governance daemon
-mkdir -p ~/.node-ops && chmod 700 ~/.node-ops
-cp node-ops-daemon/config.example.toml ~/.node-ops/config.toml
-skills/macaroon-bakery/scripts/bake.sh --container litd --network regtest --role node-ops --save-to ~/.node-ops/node-ops.macaroon
-docker cp litd:/root/.lnd/tls.cert ~/.node-ops/tls.cert
-chmod 600 ~/.node-ops/node-ops.macaroon ~/.node-ops/tls.cert
-python3 - <<'PY'                                                            # regtest credential paths
-from pathlib import Path
-path = Path.home() / ".node-ops" / "config.toml"
-body = path.read_text()
-body = body.replace('macaroon = "~/.node-ops/node-ops.macaroon"',
-                    f'macaroon = "{Path.home()}/.node-ops/node-ops.macaroon"')
-body = body.replace('tls_cert = "~/.lnd/tls.cert"',
-                    f'tls_cert = "{Path.home()}/.node-ops/tls.cert"')
-body = body.replace('approval_token_file = "~/.node-ops/operator.token"',
-                    f'approval_token_file = "{Path.home()}/.node-ops/operator.token"')
-path.write_text(body)
-PY
-python3 - <<'PY'                                                            # operator token
-import secrets
-from pathlib import Path
-path = Path.home() / ".node-ops" / "operator.token"
-path.write_text(secrets.token_urlsafe(32) + "\n")
-path.chmod(0o600)
-PY
-node-ops-daemon/node-ops-daemon ~/.node-ops/config.toml                     # run daemon
+export PATH="$PWD/bin:$PATH"                                               # expose source-checkout node-ops wrapper
+node-ops init --container litd --network regtest --force                   # bake macaroon, copy TLS, write config/token
+node-ops daemon                                                            # run daemon
 
-skills/node-ops/scripts/observe.py status                                  # daemon + kill-switch state
-skills/node-ops/scripts/observe.py pending                                 # queued approvals
-skills/node-ops/scripts/observe.py audit --limit 20                        # append-only audit entries
+node-ops status                                                            # daemon + kill-switch + monitor state
+node-ops pending                                                           # queued approvals
+node-ops audit --limit 20                                                  # append-only audit entries
+node-ops alerts --lines 20                                                 # JSONL alert tail
+node-ops watch --interval 2 status                                         # repeated read-only status check
 
-skills/node-ops/scripts/propose.py fee-set --chan-id 123 --base-msat 1000 --fee-ppm 100
-skills/node-ops/scripts/execute.py fee-set --chan-id 123 --base-msat 1000 --fee-ppm 100
-skills/node-ops/scripts/execute.py approve-fee-set --request-id <id>       # operator token required
+node-ops propose fee-set --chan-id 123 --base-msat 1000 --fee-ppm 100
+node-ops submit fee-set --chan-id 123 --base-msat 1000 --fee-ppm 100
+node-ops approve fee-set --request-id <id>                                 # operator token required
+node-ops deny fee-set --request-id <id> --reason "outside policy"
 
-skills/node-ops/scripts/propose.py rebalance --outgoing-chan-id 11 --incoming-chan-id 22 --amount-sat 50000 --max-fee-ppm 500
-skills/node-ops/scripts/execute.py rebalance --outgoing-chan-id 11 --incoming-chan-id 22 --amount-sat 50000 --max-fee-ppm 500
-skills/node-ops/scripts/execute.py approve-rebalance --request-id <id>     # operator token required
+node-ops propose rebalance --outgoing-chan-id 11 --incoming-chan-id 22 --amount-sat 50000 --max-fee-ppm 500
+node-ops submit rebalance --outgoing-chan-id 11 --incoming-chan-id 22 --amount-sat 50000 --max-fee-ppm 500
+node-ops approve rebalance --request-id <id>                               # operator token required
+node-ops audit --request-id <id> --oldest-first
 ```
 
+Operator workflow: [Node-Ops Operations](node-ops-operations.md).
 Full disposable proof: [Node-Ops Regtest E2E](node-ops-regtest-e2e.md).
 
 ## Remote Signer

@@ -14,6 +14,7 @@ the read tools or gated node-ops tools against it.**
 |------|-----|-------|
 | **Go 1.24+** | builds the MCP server | `go.mod` pins `go 1.24` (toolchain `go1.24.x`) |
 | **Docker + Compose** | runs the regtest `litd` + `bitcoind` stack | required for steps 2–6 |
+| **Python 3** | runs local node-ops helper clients | required for daemon-gated write checks |
 | `jq`, `gh` | helper scripting | |
 
 ## 1. Build the MCP server
@@ -108,6 +109,46 @@ to `node-ops-daemon`, which must be configured for regtest, hold the scoped
 macaroon, enforce fee caps, daily budgets, and cooldowns, require
 operator-token approval, and write audit entries.
 
+For local node-ops development, build and initialize the daemon sidecar:
+
+```bash
+cd node-ops-daemon
+make build
+cd ..
+
+export PATH="$PWD/bin:$PATH"
+node-ops init --container litd --network regtest --force
+node-ops daemon
+```
+
+`node-ops init` writes `~/.node-ops/config.toml`, bakes
+`~/.node-ops/node-ops.macaroon`, copies `~/.node-ops/tls.cert`, creates
+`~/.node-ops/operator.token`, and enables file alerts at
+`~/.node-ops/alerts.jsonl`. The daemon listens on `~/.node-ops/daemon.sock`;
+approvals and denials use the separate `~/.node-ops/operator.sock`.
+
+In a second terminal, run the read-only checks and then submit only through the
+gated flow:
+
+```bash
+cd /path/to/lightning-agent-tools
+export PATH="$PWD/bin:$PATH"
+
+node-ops status
+node-ops pending
+node-ops audit --limit 10
+node-ops alerts --lines 20
+
+node-ops propose fee-set --chan-id "$FEE_CHAN_ID" --base-msat 1000 --fee-ppm 100
+FEE_RESPONSE="$(node-ops submit fee-set --chan-id "$FEE_CHAN_ID" --base-msat 1000 --fee-ppm 100)"
+FEE_REQUEST_ID="$(echo "$FEE_RESPONSE" | jq -r '.request_id')"
+node-ops approve fee-set --request-id "$FEE_REQUEST_ID"
+node-ops audit --request-id "$FEE_REQUEST_ID" --oldest-first
+```
+
+Use the two-node E2E runbook when you need real channel ids and a full
+rebalance proof.
+
 ## Teardown
 
 ```bash
@@ -126,6 +167,8 @@ docker compose -f skills/lnd/templates/docker-compose-regtest.yml --profile two-
 ---
 
 ### See also
+- `docs/getting-started.md` — first-run install, regtest, and node-ops path
+- `docs/node-ops-operations.md` — daemon lifecycle, approvals, audit, alerts, and troubleshooting
 - `skills/run-litd/SKILL.md` — full litd setup (Neutrino, bitcoind, remote signer)
 - `skills/lightning-mcp-server/SKILL.md` — MCP server build & configuration
 - `skills/lnc-app/SKILL.md` — Lightning Node Connect pairing details
