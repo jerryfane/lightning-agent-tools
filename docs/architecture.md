@@ -325,12 +325,12 @@ stdin/stdout. No HTTP server, no port binding. The server's Go implementation
 lives under `lightning-mcp-server/` and is built via
 `skills/lightning-mcp-server/scripts/install.sh`.
 
-The server exposes 18 read-only tools organized into seven categories:
+The server exposes LNC-backed read tools organized into categories such as
 Connection, Node, Channels, Invoices, Payments, Peers/Network, and On-Chain.
-None of these tools can modify node state. They query balances, list channels,
-decode invoices, and inspect the network graph, but they cannot send payments,
-open channels, or change configuration. See [MCP Server](mcp-server.md) for the
-full tool reference.
+Those tools query balances, list channels, decode invoices, and inspect the
+network graph without modifying node state. Daemon-gated node-ops tools are
+separate local socket clients; see [MCP Server](mcp-server.md) for the full tool
+reference.
 
 Internally, the server uses a service manager
 (`lightning-mcp-server/internal/services/manager.go`) that initializes one service per

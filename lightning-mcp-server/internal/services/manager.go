@@ -27,7 +27,7 @@ type Manager struct {
 	lncConnection   *grpc.ClientConn
 	lightningClient lnrpc.LightningClient
 
-	// Services - read-only operations only.
+	// Services. Most LNC tools are read-only; node-ops writes are daemon gated.
 	connectionService     *tools.ConnectionService
 	invoiceService        *tools.InvoiceService
 	channelService        *tools.ChannelService
@@ -40,9 +40,10 @@ type Manager struct {
 	rebalanceService      *tools.RebalanceService
 	feeService            *tools.FeeService
 	nodeOpsAuditService   *tools.NodeOpsAuditService
+	nodeOpsFeeSetService  *tools.NodeOpsFeeSetService
 }
 
-// NewManager creates a new service manager for read-only operations.
+// NewManager creates a new service manager.
 func NewManager(logger *zap.Logger) *Manager {
 	return &Manager{
 		logger: logger,
@@ -52,13 +53,13 @@ func NewManager(logger *zap.Logger) *Manager {
 // InitializeServices prepares all services with nil clients. Clients are
 // provided once an LNC connection is established via the callback.
 func (m *Manager) InitializeServices() {
-	m.logger.Info("Initializing read-only services...")
+	m.logger.Info("Initializing MCP services...")
 
 	// Initialize connection service with callback.
 	m.connectionService = tools.NewConnectionService(
 		m.onLNCConnectionEstablished)
 
-	// Initialize all read-only services with nil clients.
+	// Initialize LNC services with nil clients.
 	m.invoiceService = tools.NewInvoiceService(nil)
 	m.channelService = tools.NewChannelService(nil)
 	m.channelActionsService = tools.NewChannelActionsService(nil)
@@ -71,18 +72,20 @@ func (m *Manager) InitializeServices() {
 	m.feeService = tools.NewFeeService(nil)
 	m.nodeOpsAuditService = tools.NewNodeOpsAuditService(
 		tools.DefaultNodeOpsDaemonSocket())
+	m.nodeOpsFeeSetService = tools.NewNodeOpsFeeSetService(
+		tools.DefaultNodeOpsDaemonSocket())
 
-	m.logger.Info("Read-only services initialized successfully")
+	m.logger.Info("MCP services initialized successfully")
 }
 
-// RegisterTools registers all read-only tools with the MCP server.
+// RegisterTools registers all tools with the MCP server.
 func (m *Manager) RegisterTools(mcpServer interfaces.MCPServer) error {
 	if mcpServer == nil {
 		return errors.New(errors.ErrCodeUnknown,
 			"MCP server cannot be nil")
 	}
 
-	m.logger.Info("Registering read-only MCP tools with server")
+	m.logger.Info("Registering MCP tools with server")
 
 	registrations := 0
 	register := func(tool *mcp.Tool,
@@ -157,7 +160,11 @@ func (m *Manager) RegisterTools(mcpServer interfaces.MCPServer) error {
 	register(m.nodeOpsAuditService.QueryAuditLedgerTool(),
 		m.nodeOpsAuditService.HandleQueryAuditLedger)
 
-	m.logger.Info("Read-only MCP tools registered",
+	// Node-ops fee-set tool - gated local daemon write request.
+	register(m.nodeOpsFeeSetService.ExecuteFeeSetTool(),
+		m.nodeOpsFeeSetService.HandleExecuteFeeSet)
+
+	m.logger.Info("MCP tools registered",
 		zap.Int("total_tools", registrations))
 	return nil
 }
@@ -171,7 +178,7 @@ func (m *Manager) onLNCConnectionEstablished(conn *grpc.ClientConn) {
 	m.lncConnection = conn
 	m.lightningClient = lnrpc.NewLightningClient(conn)
 
-	// Update existing read-only services with new connection.
+	// Update existing LNC-backed services with new connection.
 	m.invoiceService.LightningClient = m.lightningClient
 	m.channelService.LightningClient = m.lightningClient
 	m.channelActionsService.LightningClient = m.lightningClient
@@ -183,7 +190,7 @@ func (m *Manager) onLNCConnectionEstablished(conn *grpc.ClientConn) {
 	m.rebalanceService.LightningClient = m.lightningClient
 	m.feeService.LightningClient = m.lightningClient
 
-	logger.Info("All read-only services updated with new connection")
+	logger.Info("All LNC-backed services updated with new connection")
 }
 
 // Shutdown gracefully closes the LNC connection and logs shutdown results.

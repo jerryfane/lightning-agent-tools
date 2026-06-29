@@ -10,6 +10,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -41,8 +42,9 @@ const (
 
 // Request is the incoming message from a client.
 type Request struct {
-	Action string          `json:"action"`
-	Params json.RawMessage `json:"params"`
+	Action        string          `json:"action"`
+	Params        json.RawMessage `json:"params"`
+	OperatorToken string          `json:"operator_token,omitempty"`
 }
 
 // Response is the outgoing reply to a client.
@@ -139,27 +141,76 @@ func newHealthMonitor(cfg *config.Config,
 
 // Close releases the ledger handle.
 func (d *Daemon) Close() error {
-	return d.ledger.Close()
+	ledgerErr := d.ledger.Close()
+	if closer, ok := d.executor.(interface{ Close() error }); ok {
+		if err := closer.Close(); err != nil && ledgerErr == nil {
+			return err
+		}
+	}
+	return ledgerErr
 }
 
 // Run listens on sockPath (Unix domain socket, mode 0600) and handles clients
 // until ctx is cancelled.
 func (d *Daemon) Run(ctx context.Context, sockPath string) error {
-	if err := prepareSocketDir(filepath.Dir(sockPath)); err != nil {
-		return err
-	}
-	if err := removeStaleSocket(sockPath); err != nil {
-		return err
-	}
+	return d.run(ctx, []socketSpec{{
+		path:   sockPath,
+		handle: d.handleConn,
+	}})
+}
 
-	ln, err := net.Listen("unix", sockPath)
-	if err != nil {
-		return fmt.Errorf("listen %s: %w", sockPath, err)
+// RunWithOperator listens on the model-callable execution socket plus a
+// separate operator-only socket for approvals.
+func (d *Daemon) RunWithOperator(ctx context.Context, sockPath,
+	operatorSockPath string) error {
+
+	specs := []socketSpec{{
+		path:   sockPath,
+		handle: d.handleConn,
+	}}
+	operatorSockPath = strings.TrimSpace(operatorSockPath)
+	if operatorSockPath != "" {
+		if operatorSockPath == sockPath {
+			return fmt.Errorf("operator socket must differ from execution socket")
+		}
+		specs = append(specs, socketSpec{
+			path:   operatorSockPath,
+			handle: d.handleOperatorConn,
+		})
 	}
-	if err := os.Chmod(sockPath, 0600); err != nil {
-		ln.Close()
-		return fmt.Errorf("chmod socket: %w", err)
+	return d.run(ctx, specs)
+}
+
+type socketSpec struct {
+	path   string
+	handle func(net.Conn)
+}
+
+func (d *Daemon) run(ctx context.Context, specs []socketSpec) error {
+	listeners := make([]net.Listener, 0, len(specs))
+	for _, spec := range specs {
+		if err := prepareSocketDir(filepath.Dir(spec.path)); err != nil {
+			return err
+		}
+		if err := removeStaleSocket(spec.path); err != nil {
+			return err
+		}
+
+		ln, err := net.Listen("unix", spec.path)
+		if err != nil {
+			return fmt.Errorf("listen %s: %w", spec.path, err)
+		}
+		if err := os.Chmod(spec.path, 0600); err != nil {
+			ln.Close()
+			return fmt.Errorf("chmod socket: %w", err)
+		}
+		listeners = append(listeners, ln)
 	}
+	defer func() {
+		for _, ln := range listeners {
+			_ = ln.Close()
+		}
+	}()
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -179,20 +230,41 @@ func (d *Daemon) Run(ctx context.Context, sockPath string) error {
 
 	go func() {
 		<-runCtx.Done()
-		ln.Close()
+		for _, ln := range listeners {
+			_ = ln.Close()
+		}
 	}()
+
+	errCh := make(chan error, len(listeners))
+	for i, ln := range listeners {
+		spec := specs[i]
+		go serveSocket(runCtx, ln, spec.path, spec.handle, errCh)
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-errCh:
+		cancel()
+		return err
+	}
+}
+
+func serveSocket(ctx context.Context, ln net.Listener, path string,
+	handle func(net.Conn), errCh chan<- error) {
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			select {
 			case <-ctx.Done():
-				return nil
+				return
 			default:
-				return fmt.Errorf("accept: %w", err)
+				errCh <- fmt.Errorf("accept %s: %w", path, err)
+				return
 			}
 		}
-		go d.handleConn(conn)
+		go handle(conn)
 	}
 }
 
@@ -210,6 +282,26 @@ func (d *Daemon) handleConn(conn net.Conn) {
 			return
 		}
 		resp := d.dispatch(req)
+		if err := writeMessage(conn, resp); err != nil {
+			return
+		}
+	}
+}
+
+func (d *Daemon) handleOperatorConn(conn net.Conn) {
+	defer conn.Close()
+	for {
+		req, err := readMessage(conn)
+		if err != nil {
+			if err != io.EOF {
+				_ = writeMessage(conn, Response{
+					Status: "error",
+					Reason: fmt.Sprintf("read error: %v", err),
+				})
+			}
+			return
+		}
+		resp := d.dispatchOperator(req)
 		if err := writeMessage(conn, resp); err != nil {
 			return
 		}
@@ -248,6 +340,85 @@ func (d *Daemon) dispatch(req Request) Response {
 			Reason:    reason,
 		}
 	}
+}
+
+// dispatchOperator routes requests from the separate human/operator boundary.
+func (d *Daemon) dispatchOperator(req Request) Response {
+	reqID := uuid.New().String()
+	if err := d.verifyOperatorToken(req.OperatorToken); err != nil {
+		reason := "operator authentication failed: " + err.Error()
+		if recErr := d.record(reqID, req.Action, req.Params, "rejected",
+			reason); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: reason}
+	}
+
+	switch req.Action {
+	case "approve_fee_set":
+		return d.handleApproveFeeSet(reqID, req.Params)
+	case "deny_fee_set":
+		return d.handleDenyFeeSet(reqID, req.Params)
+	case "list_pending":
+		return d.handleListPending(reqID)
+	case "status":
+		if err := d.record(reqID, req.Action, req.Params, "ok", ""); err != nil {
+			return ledgerFailure(reqID, err)
+		}
+		return Response{
+			Status:    "ok",
+			RequestID: reqID,
+			Result:    d.statusResult(),
+		}
+	default:
+		reason := fmt.Sprintf("unknown operator action: %q", req.Action)
+		if err := d.record(reqID, req.Action, req.Params, "rejected", reason); err != nil {
+			return ledgerFailure(reqID, err)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: reason}
+	}
+}
+
+func (d *Daemon) verifyOperatorToken(presented string) error {
+	presented = strings.TrimSpace(presented)
+	if presented == "" {
+		return fmt.Errorf("missing operator token")
+	}
+	expected, err := loadOperatorToken(d.cfg.Operator.ApprovalTokenFile)
+	if err != nil {
+		return err
+	}
+	if subtle.ConstantTimeCompare([]byte(presented), []byte(expected)) != 1 {
+		return fmt.Errorf("invalid operator token")
+	}
+	return nil
+}
+
+func loadOperatorToken(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", fmt.Errorf("operator token file is not configured")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("load operator token: %w", err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("operator token file is a directory")
+	}
+	if info.Mode().Perm()&0077 != 0 {
+		return "", fmt.Errorf("operator token file %s must not be group/other readable", path)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read operator token: %w", err)
+	}
+	token := strings.TrimSpace(string(body))
+	if token == "" {
+		return "", fmt.Errorf("operator token file is empty")
+	}
+	return token, nil
 }
 
 func (d *Daemon) record(reqID, action string, params json.RawMessage,
@@ -446,6 +617,11 @@ type rawFeeSetParams struct {
 	FeePpm   *int64  `json:"fee_ppm"`
 }
 
+type approvalParams struct {
+	RequestID string `json:"request_id"`
+	Reason    string `json:"reason"`
+}
+
 type feeSetPolicyDelta struct {
 	ppmDelta    int64
 	baseChanged bool
@@ -485,9 +661,13 @@ func (d *Daemon) handleFeeSet(reqID string, raw json.RawMessage) Response {
 		}
 		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
 	}
+	if err := d.limits.CheckFeeSet(p.ChanID, delta.ppmDelta); err != nil {
+		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
+			err.Error()); recErr != nil {
 
-	if !d.needsApproval(delta) {
-		return d.executeFeeSet(reqID, raw, p)
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
 	}
 
 	if resp, stopped := d.rejectIfKillSwitchActive(reqID, "execute_fee_set",
@@ -496,6 +676,19 @@ func (d *Daemon) handleFeeSet(reqID string, raw json.RawMessage) Response {
 		return resp
 	}
 	return d.queueFeeSet(reqID, raw)
+}
+
+func parseApprovalParams(raw json.RawMessage) (approvalParams, error) {
+	var params approvalParams
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return approvalParams{}, err
+	}
+	params.RequestID = strings.TrimSpace(params.RequestID)
+	params.Reason = strings.TrimSpace(params.Reason)
+	if params.RequestID == "" {
+		return approvalParams{}, fmt.Errorf("missing request_id")
+	}
+	return params, nil
 }
 
 func parseFeeSetParams(raw json.RawMessage) (feeSetParams, error) {
@@ -619,17 +812,109 @@ func (d *Daemon) feeSetPolicyDelta(ctx context.Context,
 	}, nil
 }
 
-func (d *Daemon) needsApproval(delta feeSetPolicyDelta) bool {
-	ppmDelta := delta.ppmDelta
-	if ppmDelta < 0 {
-		ppmDelta = -ppmDelta
+func (d *Daemon) handleApproveFeeSet(reqID string, raw json.RawMessage) Response {
+	params, err := parseApprovalParams(raw)
+	if err != nil {
+		if recErr := d.record(reqID, "approve_fee_set", raw, "rejected",
+			"invalid params: "+err.Error()); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID,
+			Reason: "invalid params: " + err.Error()}
 	}
-	return d.cfg.Approval.RequireApproval || delta.baseChanged ||
-		ppmDelta > d.cfg.Approval.AutoExecuteBelowPpmDelta
+
+	item, ok := d.queue.Approve(params.RequestID)
+	if !ok {
+		reason := "pending request not found"
+		if recErr := d.record(reqID, "approve_fee_set", raw, "rejected",
+			reason); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: reason}
+	}
+	if recErr := d.record(reqID, "approve_fee_set", raw, "approved",
+		item.RequestID); recErr != nil {
+
+		return ledgerFailure(reqID, recErr)
+	}
+
+	p, err := parseFeeSetParams(json.RawMessage(item.Params))
+	if err != nil {
+		reason := "queued params invalid: " + err.Error()
+		if recErr := d.record(item.RequestID, "execute_fee_set",
+			json.RawMessage(item.Params), "failed", reason); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: reason}
+	}
+
+	execResp := d.executeFeeSet(
+		item.RequestID, json.RawMessage(item.Params), p, true,
+	)
+	if execResp.Status != "ok" {
+		return execResp
+	}
+	return Response{
+		Status:    "ok",
+		RequestID: reqID,
+		Result: map[string]interface{}{
+			"approved_request_id": item.RequestID,
+			"execution":           execResp,
+		},
+	}
+}
+
+func (d *Daemon) handleDenyFeeSet(reqID string, raw json.RawMessage) Response {
+	params, err := parseApprovalParams(raw)
+	if err != nil {
+		if recErr := d.record(reqID, "deny_fee_set", raw, "rejected",
+			"invalid params: "+err.Error()); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID,
+			Reason: "invalid params: " + err.Error()}
+	}
+
+	reason := params.Reason
+	if reason == "" {
+		reason = "operator denied"
+	}
+	item, ok := d.queue.Reject(params.RequestID, reason)
+	if !ok {
+		if recErr := d.record(reqID, "deny_fee_set", raw, "rejected",
+			"pending request not found"); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID,
+			Reason: "pending request not found"}
+	}
+	if recErr := d.record(reqID, "deny_fee_set", raw, "denied",
+		reason); recErr != nil {
+
+		return ledgerFailure(reqID, recErr)
+	}
+	if recErr := d.record(item.RequestID, "execute_fee_set",
+		json.RawMessage(item.Params), "denied", reason); recErr != nil {
+
+		return ledgerFailure(reqID, recErr)
+	}
+	return Response{
+		Status:    "ok",
+		RequestID: reqID,
+		Result: map[string]interface{}{
+			"denied_request_id": item.RequestID,
+			"reason":            reason,
+		},
+	}
 }
 
 func (d *Daemon) executeFeeSet(reqID string, raw json.RawMessage,
-	p feeSetParams) Response {
+	p feeSetParams, approvalSatisfied bool) Response {
 
 	d.execMu.Lock()
 	defer d.execMu.Unlock()
@@ -651,7 +936,7 @@ func (d *Daemon) executeFeeSet(reqID string, raw json.RawMessage,
 		}
 		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
 	}
-	if d.needsApproval(delta) {
+	if !approvalSatisfied {
 		if resp, stopped := d.rejectIfKillSwitchActive(reqID, "execute_fee_set",
 			raw); stopped {
 
@@ -664,7 +949,9 @@ func (d *Daemon) executeFeeSet(reqID string, raw json.RawMessage,
 
 		return resp
 	}
-	reservation, err := d.limits.ReserveChannelOperation(p.ChanID)
+	reservation, err := d.limits.ReserveFeeSetOperation(
+		p.ChanID, delta.ppmDelta,
+	)
 	if err != nil {
 		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
 			err.Error()); recErr != nil {
@@ -675,7 +962,7 @@ func (d *Daemon) executeFeeSet(reqID string, raw json.RawMessage,
 	}
 	if killswitch.Active(d.cfg.Storage.KillswitchFile) {
 		reason := "killswitch active: all execution is halted"
-		if rollbackErr := d.limits.RollbackChannelOperation(reservation); rollbackErr != nil {
+		if rollbackErr := d.limits.RollbackFeeSetOperation(reservation); rollbackErr != nil {
 			reason = reason + "; limits rollback failed: " + rollbackErr.Error()
 		}
 		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
@@ -686,14 +973,14 @@ func (d *Daemon) executeFeeSet(reqID string, raw json.RawMessage,
 		return Response{Status: "error", RequestID: reqID, Reason: reason}
 	}
 	if err := d.record(reqID, "execute_fee_set", raw, "accepted", ""); err != nil {
-		_ = d.limits.RollbackChannelOperation(reservation)
+		_ = d.limits.RollbackFeeSetOperation(reservation)
 		return ledgerFailure(reqID, err)
 	}
 	if err := d.executor.ExecuteFeeSet(context.Background(), executor.FeeSetRequest{
 		ChanID: p.ChanID, BaseMsat: p.BaseMsat, FeePpm: p.FeePpm,
 	}); err != nil {
 		reason := err.Error()
-		if rollbackErr := d.limits.RollbackChannelOperation(reservation); rollbackErr != nil {
+		if rollbackErr := d.limits.RollbackFeeSetOperation(reservation); rollbackErr != nil {
 			reason = reason + "; limits rollback failed: " + rollbackErr.Error()
 		}
 		if recErr := d.record(reqID, "execute_fee_set", raw, "failed",
@@ -703,7 +990,7 @@ func (d *Daemon) executeFeeSet(reqID string, raw json.RawMessage,
 		}
 		return Response{Status: "error", RequestID: reqID, Reason: reason}
 	}
-	if err := d.limits.RecordChannelOperation(p.ChanID); err != nil {
+	if err := d.limits.RecordFeeSetOperation(p.ChanID); err != nil {
 		reason := "limits state refresh failed: " + err.Error()
 		if recErr := d.record(reqID, "execute_fee_set", raw, "executed",
 			reason); recErr != nil {

@@ -92,9 +92,12 @@ using a 10-word pairing phrase. No credentials are written to disk. The
 pairing phrase is handled in memory and an ephemeral ECDSA keypair is generated
 per session. When the session ends, the keypair is discarded.
 
-This tier exposes 18 read-only tools. The agent can query balances, list
-channels, decode invoices, and inspect the network graph, but it cannot send
-payments, open channels, or modify any node state.
+This tier exposes read-only LNC tools. The agent can query balances, list
+channels, decode invoices, and inspect the network graph through LNC. Supported
+node-ops writes are not direct LNC mutations; they are local daemon requests
+with scoped credentials, limits, approvals, and audit logging enforced outside
+the MCP session. Fee-set approvals require the separate operator socket plus a
+private operator token file that is not passed to the MCP server.
 
 **If the agent machine is compromised,** the attacker gains read access to the
 node's state for the duration of the active LNC session. Once the session is

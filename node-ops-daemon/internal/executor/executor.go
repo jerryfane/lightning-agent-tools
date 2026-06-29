@@ -27,8 +27,9 @@ type FeeSetRequest struct {
 
 // FeePolicy is the daemon-owned current forwarding fee policy for a channel.
 type FeePolicy struct {
-	BaseMsat int64
-	FeePpm   int64
+	BaseMsat      int64
+	FeePpm        int64
+	TimeLockDelta uint32
 }
 
 // HealthAlert is one prioritized node health alert from the read-only health

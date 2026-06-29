@@ -12,15 +12,17 @@ import (
 )
 
 type persistentState struct {
-	DailySpentSat int64                `json:"daily_spent_sat"`
-	LastResetDay  string               `json:"last_reset_day"`
-	ChannelLastOp map[uint64]time.Time `json:"channel_last_op"`
+	DailySpentSat    int64                `json:"daily_spent_sat"`
+	DailyFeePpmSpent int64                `json:"daily_fee_ppm_spent"`
+	LastResetDay     string               `json:"last_reset_day"`
+	ChannelLastOp    map[uint64]time.Time `json:"channel_last_op"`
 }
 
 type persistentStateFile struct {
-	DailySpentSat *int64                `json:"daily_spent_sat"`
-	LastResetDay  *string               `json:"last_reset_day"`
-	ChannelLastOp *map[uint64]time.Time `json:"channel_last_op"`
+	DailySpentSat    *int64                `json:"daily_spent_sat"`
+	DailyFeePpmSpent *int64                `json:"daily_fee_ppm_spent"`
+	LastResetDay     *string               `json:"last_reset_day"`
+	ChannelLastOp    *map[uint64]time.Time `json:"channel_last_op"`
 }
 
 func (e *Engine) loadState() error {
@@ -42,6 +44,9 @@ func (e *Engine) loadState() error {
 	if *state.DailySpentSat < 0 {
 		return fmt.Errorf("decode limits state %s: daily_spent_sat must be non-negative", e.statePath)
 	}
+	if state.DailyFeePpmSpent != nil && *state.DailyFeePpmSpent < 0 {
+		return fmt.Errorf("decode limits state %s: daily_fee_ppm_spent must be non-negative", e.statePath)
+	}
 	if state.LastResetDay == nil {
 		return fmt.Errorf("decode limits state %s: missing last_reset_day", e.statePath)
 	}
@@ -59,6 +64,9 @@ func (e *Engine) loadState() error {
 	}
 
 	e.dailySpentSat = *state.DailySpentSat
+	if state.DailyFeePpmSpent != nil {
+		e.dailyFeePpmSpent = *state.DailyFeePpmSpent
+	}
 	e.lastResetDay = *state.LastResetDay
 	e.channelLastOp = *state.ChannelLastOp
 	return nil
@@ -72,9 +80,10 @@ func (e *Engine) persistLocked() error {
 	}
 
 	state := persistentState{
-		DailySpentSat: e.dailySpentSat,
-		LastResetDay:  e.lastResetDay,
-		ChannelLastOp: persistentChannelLastOp(e.channelLastOp),
+		DailySpentSat:    e.dailySpentSat,
+		DailyFeePpmSpent: e.dailyFeePpmSpent,
+		LastResetDay:     e.lastResetDay,
+		ChannelLastOp:    persistentChannelLastOp(e.channelLastOp),
 	}
 	body, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {

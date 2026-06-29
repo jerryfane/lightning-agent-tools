@@ -5,7 +5,10 @@
 # Maximum satoshis the daemon may rebalance per UTC calendar day.
 daily_rebalance_budget_sat = 1_000_000
 
-# Largest single fee change (absolute value, in ppm) that can be auto-executed.
+# Maximum cumulative absolute fee-rate delta (ppm) that can execute per UTC day.
+daily_fee_ppm_budget = 500
+
+# Largest single fee change (absolute value, in ppm) that can execute.
 max_fee_ppm_delta = 100
 
 # Minimum time between successive operations on the same channel (Go duration string).
@@ -15,10 +18,10 @@ per_channel_cooldown = "1h"
 rebalance_max_fee_ppm = 500
 
 [approval]
-# Changes with |delta_ppm| <= this value are auto-executed (when require_approval = false).
+# Reserved for future action types. Fee-set execution always requires approval.
 auto_execute_below_ppm_delta = 20
 
-# When true, every action is queued for human review regardless of size.
+# Fee-set execution is queued for human review regardless of size.
 require_approval = true
 
 [storage]
@@ -30,6 +33,29 @@ limits_state = "~/.node-ops/limits-state.json"
 
 # Creating this file halts all daemon execution immediately.
 killswitch = "~/.node-ops/STOP"
+
+[node]
+# LND gRPC endpoint controlled by the daemon. The first gated write path is
+# regtest-only; mainnet is intentionally rejected.
+lnd_rpc = "127.0.0.1:10009"
+required_network = "regtest"
+
+# Scoped node-ops macaroon. Do not point this at admin.macaroon.
+macaroon = "~/.node-ops/node-ops.macaroon"
+tls_cert = "~/.lnd/tls.cert"
+
+# Bound startup dials and per-RPC calls.
+dial_timeout = "5s"
+request_timeout = "10s"
+
+[operator]
+# Separate human/operator-only socket for approve/deny actions. This is not
+# exposed through the model-callable MCP server.
+approval_socket = "~/.node-ops/operator.sock"
+
+# Human/operator-only token file required on the operator socket. Keep this
+# file mode 0600 and do not expose it to the MCP host process.
+approval_token_file = "~/.node-ops/operator.token"
 
 [monitor]
 # Start a background read-only node_health poller when the daemon starts.

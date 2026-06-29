@@ -18,8 +18,12 @@ type Limits struct {
 	// DailyRebalanceBudgetSat is the max sats that may be rebalanced per UTC day.
 	DailyRebalanceBudgetSat int64 `toml:"daily_rebalance_budget_sat"`
 
+	// DailyFeePpmBudget is the max cumulative absolute fee-rate delta, in ppm,
+	// that may be executed per UTC day.
+	DailyFeePpmBudget int64 `toml:"daily_fee_ppm_budget"`
+
 	// MaxFeePpmDelta is the largest single fee change (absolute, in ppm) the
-	// daemon may auto-execute.
+	// daemon may execute.
 	MaxFeePpmDelta int64 `toml:"max_fee_ppm_delta"`
 
 	// PerChannelCooldown is a Go duration string (e.g. "1h") enforcing a
@@ -30,14 +34,14 @@ type Limits struct {
 	RebalanceMaxFeePpm int64 `toml:"rebalance_max_fee_ppm"`
 }
 
-// Approval decides whether requests are auto-executed or queued.
+// Approval controls pending-queue policy for money-affecting actions.
 type Approval struct {
-	// AutoExecuteBelowPpmDelta: if |delta| <= this value and RequireApproval
-	// is false, the daemon executes immediately without human review.
+	// AutoExecuteBelowPpmDelta is reserved for future action types. Fee-set
+	// execution always requires operator approval.
 	AutoExecuteBelowPpmDelta int64 `toml:"auto_execute_below_ppm_delta"`
 
-	// RequireApproval forces every action into the pending queue regardless
-	// of size.
+	// RequireApproval forces supported actions into the pending queue regardless
+	// of size. Fee-set execution is always queued.
 	RequireApproval bool `toml:"require_approval"`
 }
 
@@ -51,6 +55,37 @@ type Storage struct {
 
 	// KillswitchFile is the path whose mere presence halts all execution.
 	KillswitchFile string `toml:"killswitch"`
+}
+
+// Node holds the daemon-owned LND connection and scoped macaroon settings.
+type Node struct {
+	// LndRPC is the host:port of the LND gRPC endpoint.
+	LndRPC string `toml:"lnd_rpc"`
+
+	// MacaroonPath is the node-ops scoped macaroon loaded only by the daemon.
+	MacaroonPath string `toml:"macaroon"`
+
+	// TLSCertPath is the TLS certificate used to authenticate the LND endpoint.
+	TLSCertPath string `toml:"tls_cert"`
+
+	// RequiredNetwork is the only LND network this first write path may use.
+	RequiredNetwork string `toml:"required_network"`
+
+	// DialTimeout bounds startup connection attempts.
+	DialTimeout string `toml:"dial_timeout"`
+
+	// RequestTimeout bounds individual LND RPCs.
+	RequestTimeout string `toml:"request_timeout"`
+}
+
+// Operator holds the human/operator-only approval boundary.
+type Operator struct {
+	// ApprovalSocket is the separate local socket for approve/deny actions.
+	ApprovalSocket string `toml:"approval_socket"`
+
+	// ApprovalTokenFile is a human/operator-only token required on the
+	// operator socket before approve/deny actions are accepted.
+	ApprovalTokenFile string `toml:"approval_token_file"`
 }
 
 // Monitor controls background read-only node health polling and alert output.
@@ -76,6 +111,8 @@ type Config struct {
 	Limits   Limits   `toml:"limits"`
 	Approval Approval `toml:"approval"`
 	Storage  Storage  `toml:"storage"`
+	Node     Node     `toml:"node"`
+	Operator Operator `toml:"operator"`
 	Monitor  Monitor  `toml:"monitor"`
 }
 
@@ -92,6 +129,7 @@ func Defaults() *Config {
 	return &Config{
 		Limits: Limits{
 			DailyRebalanceBudgetSat: 1_000_000,
+			DailyFeePpmBudget:       500,
 			MaxFeePpmDelta:          100,
 			PerChannelCooldown:      "1h",
 			RebalanceMaxFeePpm:      500,
@@ -104,6 +142,18 @@ func Defaults() *Config {
 			LedgerPath:      filepath.Join(base, "ledger.db"),
 			LimitsStatePath: filepath.Join(base, "limits-state.json"),
 			KillswitchFile:  filepath.Join(base, "STOP"),
+		},
+		Node: Node{
+			LndRPC:          "127.0.0.1:10009",
+			MacaroonPath:    filepath.Join(base, "node-ops.macaroon"),
+			TLSCertPath:     filepath.Join(home, ".lnd", "tls.cert"),
+			RequiredNetwork: "regtest",
+			DialTimeout:     "5s",
+			RequestTimeout:  "10s",
+		},
+		Operator: Operator{
+			ApprovalSocket:    filepath.Join(base, "operator.sock"),
+			ApprovalTokenFile: filepath.Join(base, "operator.token"),
 		},
 		Monitor: Monitor{
 			Enabled:       false,
@@ -139,6 +189,10 @@ func (c *Config) expand() error {
 	c.Storage.LedgerPath = expandHome(c.Storage.LedgerPath, home)
 	c.Storage.LimitsStatePath = expandHome(c.Storage.LimitsStatePath, home)
 	c.Storage.KillswitchFile = expandHome(c.Storage.KillswitchFile, home)
+	c.Node.MacaroonPath = expandHome(c.Node.MacaroonPath, home)
+	c.Node.TLSCertPath = expandHome(c.Node.TLSCertPath, home)
+	c.Operator.ApprovalSocket = expandHome(c.Operator.ApprovalSocket, home)
+	c.Operator.ApprovalTokenFile = expandHome(c.Operator.ApprovalTokenFile, home)
 	c.Monitor.AlertPath = expandHome(c.Monitor.AlertPath, home)
 	return nil
 }
@@ -152,6 +206,36 @@ func (c *Config) validate() error {
 	}
 	if strings.TrimSpace(c.Storage.KillswitchFile) == "" {
 		return fmt.Errorf("storage.killswitch must not be empty")
+	}
+	if c.Limits.DailyFeePpmBudget < 0 {
+		return fmt.Errorf("limits.daily_fee_ppm_budget must be non-negative")
+	}
+	if strings.TrimSpace(c.Node.LndRPC) == "" {
+		return fmt.Errorf("node.lnd_rpc must not be empty")
+	}
+	if strings.TrimSpace(c.Node.MacaroonPath) == "" {
+		return fmt.Errorf("node.macaroon must not be empty")
+	}
+	if strings.TrimSpace(c.Node.TLSCertPath) == "" {
+		return fmt.Errorf("node.tls_cert must not be empty")
+	}
+	if strings.TrimSpace(c.Node.RequiredNetwork) == "" {
+		return fmt.Errorf("node.required_network must not be empty")
+	}
+	if strings.TrimSpace(c.Node.RequiredNetwork) != "regtest" {
+		return fmt.Errorf("node.required_network must be regtest for gated writes")
+	}
+	if err := validateDuration("node.dial_timeout", c.Node.DialTimeout, true); err != nil {
+		return err
+	}
+	if err := validateDuration("node.request_timeout", c.Node.RequestTimeout, true); err != nil {
+		return err
+	}
+	if strings.TrimSpace(c.Operator.ApprovalSocket) == "" {
+		return fmt.Errorf("operator.approval_socket must not be empty")
+	}
+	if strings.TrimSpace(c.Operator.ApprovalTokenFile) == "" {
+		return fmt.Errorf("operator.approval_token_file must not be empty")
 	}
 	if err := validateDuration("monitor.poll_interval", c.Monitor.PollInterval, true); err != nil {
 		return err

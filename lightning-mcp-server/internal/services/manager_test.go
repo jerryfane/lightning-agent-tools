@@ -37,6 +37,7 @@ func TestManager_Creation(t *testing.T) {
 	assert.NotNil(t, manager.invoiceService)
 	assert.NotNil(t, manager.connectionService)
 	assert.NotNil(t, manager.nodeOpsAuditService)
+	assert.NotNil(t, manager.nodeOpsFeeSetService)
 }
 
 // Test RegisterTools with valid MCP server.
@@ -56,15 +57,16 @@ func TestManager_RegisterTools(t *testing.T) {
 		names[tool.Name] = struct{}{}
 	}
 
-	// Test read-only tools are registered
+	// Test representative tools are registered.
 	assert.Contains(t, names, "lnc_decode_invoice")
 	assert.Contains(t, names, "lnc_list_channels")
 	assert.Contains(t, names, "lnc_list_unspent")
 	assert.Contains(t, names, "lnc_query_node_ops_audit")
+	assert.Contains(t, names, "lnc_execute_fee_set")
 	assert.NotZero(t, len(stub.tools))
 }
 
-func TestManager_RegisterTools_ReadOnlyMode(t *testing.T) {
+func TestManager_RegisterTools_GatedMode(t *testing.T) {
 	err := logging.InitLogger(true)
 	require.NoError(t, err)
 
@@ -80,7 +82,7 @@ func TestManager_RegisterTools_ReadOnlyMode(t *testing.T) {
 		names[tool.Name] = struct{}{}
 	}
 
-	// Verify write operations are not available
+	// Verify direct LNC write operations are not available.
 	assert.NotContains(t, names, "lnc_send_payment")
 	assert.NotContains(t, names, "lnc_pay_invoice")
 	assert.NotContains(t, names, "lnc_open_channel")
@@ -91,13 +93,14 @@ func TestManager_RegisterTools_ReadOnlyMode(t *testing.T) {
 	assert.NotContains(t, names, "lnc_connect_peer")
 	assert.NotContains(t, names, "lnc_disconnect_peer")
 
-	// Verify read-only operations are available
+	// Verify read-only operations and daemon-gated node-ops tools are available.
 	assert.Contains(t, names, "lnc_list_channels")
 	assert.Contains(t, names, "lnc_get_info")
 	assert.Contains(t, names, "lnc_list_unspent")
 	assert.Contains(t, names, "lnc_decode_invoice")
 	assert.Contains(t, names, "lnc_list_peers")
 	assert.Contains(t, names, "lnc_query_node_ops_audit")
+	assert.Contains(t, names, "lnc_execute_fee_set")
 	assert.Len(t, stub.tools, len(names))
 }
 
@@ -182,8 +185,9 @@ func TestManager_ServiceIntegration(t *testing.T) {
 	assert.NotNil(t, manager.peerService)
 	assert.NotNil(t, manager.nodeService)
 	assert.NotNil(t, manager.nodeOpsAuditService)
+	assert.NotNil(t, manager.nodeOpsFeeSetService)
 
-	// Test that read-only tools can be created
+	// Test that representative tools can be created.
 	decodeInvoiceTool := manager.invoiceService.DecodeInvoiceTool()
 	connectTool := manager.connectionService.ConnectTool()
 	disconnectTool := manager.connectionService.DisconnectTool()

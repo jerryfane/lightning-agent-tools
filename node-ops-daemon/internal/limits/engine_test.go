@@ -183,6 +183,83 @@ func TestPersistentDailyBudgetSurvivesRestart(t *testing.T) {
 	}
 }
 
+func TestPersistentFeeSetBudgetSurvivesRestart(t *testing.T) {
+	cfg := config.Limits{
+		DailyRebalanceBudgetSat: 1000,
+		DailyFeePpmBudget:       15,
+		MaxFeePpmDelta:          1000,
+		PerChannelCooldown:      "0s",
+		RebalanceMaxFeePpm:      1000,
+	}
+	path := filepath.Join(t.TempDir(), "limits-state.json")
+
+	eng := newPersistentEngine(t, cfg, path)
+	reservation, err := eng.ReserveFeeSetOperation(1, 10)
+	if err != nil {
+		t.Fatalf("ReserveFeeSetOperation: %v", err)
+	}
+	if err := eng.RecordFeeSetOperation(1); err != nil {
+		t.Fatalf("RecordFeeSetOperation: %v", err)
+	}
+
+	restarted := newPersistentEngine(t, cfg, path)
+	if _, err := restarted.ReserveFeeSetOperation(2, 6); err == nil {
+		t.Fatal("expected persisted daily fee budget exhaustion after restart")
+	}
+	if err := restarted.RollbackFeeSetOperation(reservation); err != nil {
+		t.Fatalf("stale rollback should be harmless: %v", err)
+	}
+	if _, err := restarted.ReserveFeeSetOperation(2, 5); err != nil {
+		t.Fatalf("expected exact persisted remaining budget to be allowed: %v", err)
+	}
+}
+
+func TestRollbackFeeSetOperationRestoresBudgetAndCooldown(t *testing.T) {
+	cfg := config.Limits{
+		DailyRebalanceBudgetSat: 1000,
+		DailyFeePpmBudget:       10,
+		MaxFeePpmDelta:          1000,
+		PerChannelCooldown:      "1h",
+		RebalanceMaxFeePpm:      1000,
+	}
+	path := filepath.Join(t.TempDir(), "limits-state.json")
+
+	eng := newPersistentEngine(t, cfg, path)
+	reservation, err := eng.ReserveFeeSetOperation(42, 10)
+	if err != nil {
+		t.Fatalf("ReserveFeeSetOperation: %v", err)
+	}
+	if err := eng.RollbackFeeSetOperation(reservation); err != nil {
+		t.Fatalf("RollbackFeeSetOperation: %v", err)
+	}
+
+	restarted := newPersistentEngine(t, cfg, path)
+	if _, err := restarted.ReserveFeeSetOperation(42, 10); err != nil {
+		t.Fatalf("rollback should restore budget and cooldown: %v", err)
+	}
+}
+
+func TestPersistentOldStateDefaultsFeeBudgetSpent(t *testing.T) {
+	cfg := config.Limits{
+		DailyRebalanceBudgetSat: 1000,
+		DailyFeePpmBudget:       10,
+		MaxFeePpmDelta:          1000,
+		PerChannelCooldown:      "0s",
+		RebalanceMaxFeePpm:      1000,
+	}
+	path := filepath.Join(t.TempDir(), "limits-state.json")
+	if err := os.WriteFile(path, []byte(
+		`{"daily_spent_sat":0,"last_reset_day":"2026-01-01","channel_last_op":{}}`,
+	), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	eng := newPersistentEngine(t, cfg, path)
+	if _, err := eng.ReserveFeeSetOperation(1, 10); err != nil {
+		t.Fatalf("old state should default daily fee ppm spent to zero: %v", err)
+	}
+}
+
 func TestPersistentCooldownSurvivesRestart(t *testing.T) {
 	cfg := config.Limits{
 		DailyRebalanceBudgetSat: 1_000_000,
