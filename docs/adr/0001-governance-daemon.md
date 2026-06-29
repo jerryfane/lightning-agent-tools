@@ -91,8 +91,9 @@ graph TD
    require_approval             = true   # …everything else queues for a human
 
    [storage]
-   ledger = "~/.node-ops/ledger.db"      # SQLite
-   killswitch = "~/.node-ops/STOP"       # presence halts all execution
+   ledger = "~/.node-ops/ledger.db"              # SQLite
+   limits_state = "~/.node-ops/limits-state.json" # budgets/cooldowns
+   killswitch = "~/.node-ops/STOP"               # presence halts all execution
 
    [operator]
    approval_socket = "~/.node-ops/operator.sock"  # separate human/operator boundary

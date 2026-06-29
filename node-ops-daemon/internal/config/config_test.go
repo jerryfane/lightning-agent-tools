@@ -30,7 +30,8 @@ max_fee_ppm_delta = 42
 	if !cfg.Approval.RequireApproval {
 		t.Fatalf("partial config should preserve require_approval default")
 	}
-	if cfg.Storage.LedgerPath == "" || cfg.Storage.KillswitchFile == "" {
+	if cfg.Storage.LedgerPath == "" || cfg.Storage.LimitsStatePath == "" ||
+		cfg.Storage.KillswitchFile == "" {
 		t.Fatalf("partial config should preserve storage defaults: %+v", cfg.Storage)
 	}
 }
@@ -40,6 +41,7 @@ func TestLoadExpandsStoragePaths(t *testing.T) {
 	err := os.WriteFile(path, []byte(`
 [storage]
 ledger = "~/.node-ops/custom-ledger.db"
+limits_state = "~/.node-ops/custom-limits-state.json"
 killswitch = "~/.node-ops/CUSTOM_STOP"
 `), 0600)
 	if err != nil {
@@ -57,6 +59,9 @@ killswitch = "~/.node-ops/CUSTOM_STOP"
 
 	if want := filepath.Join(home, ".node-ops", "custom-ledger.db"); cfg.Storage.LedgerPath != want {
 		t.Fatalf("ledger path = %q, want %q", cfg.Storage.LedgerPath, want)
+	}
+	if want := filepath.Join(home, ".node-ops", "custom-limits-state.json"); cfg.Storage.LimitsStatePath != want {
+		t.Fatalf("limits state path = %q, want %q", cfg.Storage.LimitsStatePath, want)
 	}
 	if want := filepath.Join(home, ".node-ops", "CUSTOM_STOP"); cfg.Storage.KillswitchFile != want {
 		t.Fatalf("killswitch path = %q, want %q", cfg.Storage.KillswitchFile, want)
@@ -76,6 +81,14 @@ func TestLoadRejectsEmptyStoragePaths(t *testing.T) {
 	ledger = ""
 	`,
 			wantErr: "storage.ledger",
+		},
+		{
+			name: "limits_state",
+			body: `
+	[storage]
+	limits_state = ""
+	`,
+			wantErr: "storage.limits_state",
 		},
 		{
 			name: "killswitch",

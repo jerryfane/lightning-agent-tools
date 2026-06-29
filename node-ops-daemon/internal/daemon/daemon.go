@@ -57,12 +57,15 @@ type Daemon struct {
 
 // New creates a Daemon, initialises the limits engine and opens the ledger.
 func New(cfg *config.Config, exec executor.NodeExecutor) (*Daemon, error) {
-	eng, err := limits.New(cfg.Limits)
-	if err != nil {
-		return nil, fmt.Errorf("limits engine: %w", err)
-	}
 	if err := prepareLedgerDir(filepath.Dir(cfg.Storage.LedgerPath)); err != nil {
 		return nil, err
+	}
+	if err := prepareLimitsStateDir(filepath.Dir(cfg.Storage.LimitsStatePath)); err != nil {
+		return nil, err
+	}
+	eng, err := limits.NewPersistent(cfg.Limits, cfg.Storage.LimitsStatePath)
+	if err != nil {
+		return nil, fmt.Errorf("limits engine: %w", err)
 	}
 	l, err := ledger.Open(cfg.Storage.LedgerPath)
 	if err != nil {
@@ -317,6 +320,10 @@ func prepareLedgerDir(dir string) error {
 	return preparePrivateDir("ledger", dir, false)
 }
 
+func prepareLimitsStateDir(dir string) error {
+	return preparePrivateDir("limits state", dir, false)
+}
+
 func prepareSocketDir(dir string) error {
 	return preparePrivateDir("socket", dir, true)
 }
@@ -440,7 +447,13 @@ func (d *Daemon) executeFeeSet(reqID string, raw json.RawMessage,
 		}
 		return d.queueFeeSet(reqID, raw)
 	}
-	if err := d.limits.CheckChannelCooldown(p.ChanID); err != nil {
+	if resp, stopped := d.rejectIfKillSwitchActive(reqID, "execute_fee_set",
+		raw); stopped {
+
+		return resp
+	}
+	reservation, err := d.limits.ReserveChannelOperation(p.ChanID)
+	if err != nil {
 		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
 			err.Error()); recErr != nil {
 
@@ -448,25 +461,50 @@ func (d *Daemon) executeFeeSet(reqID string, raw json.RawMessage,
 		}
 		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
 	}
-	if resp, stopped := d.rejectIfKillSwitchActive(reqID, "execute_fee_set",
-		raw); stopped {
+	if killswitch.Active(d.cfg.Storage.KillswitchFile) {
+		reason := "killswitch active: all execution is halted"
+		if rollbackErr := d.limits.RollbackChannelOperation(reservation); rollbackErr != nil {
+			reason = reason + "; limits rollback failed: " + rollbackErr.Error()
+		}
+		if recErr := d.record(reqID, "execute_fee_set", raw, "rejected",
+			"killswitch active"); recErr != nil {
 
-		return resp
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "error", RequestID: reqID, Reason: reason}
 	}
 	if err := d.record(reqID, "execute_fee_set", raw, "accepted", ""); err != nil {
+		_ = d.limits.RollbackChannelOperation(reservation)
 		return ledgerFailure(reqID, err)
 	}
 	if err := d.executor.ExecuteFeeSet(context.Background(), executor.FeeSetRequest{
 		ChanID: p.ChanID, BaseMsat: p.BaseMsat, FeePpm: p.FeePpm,
 	}); err != nil {
+		reason := err.Error()
+		if rollbackErr := d.limits.RollbackChannelOperation(reservation); rollbackErr != nil {
+			reason = reason + "; limits rollback failed: " + rollbackErr.Error()
+		}
 		if recErr := d.record(reqID, "execute_fee_set", raw, "failed",
-			err.Error()); recErr != nil {
+			reason); recErr != nil {
 
 			return ledgerFailure(reqID, recErr)
 		}
-		return Response{Status: "error", RequestID: reqID, Reason: err.Error()}
+		return Response{Status: "error", RequestID: reqID, Reason: reason}
 	}
-	d.limits.RecordChannelOperation(p.ChanID)
+	if err := d.limits.RecordChannelOperation(p.ChanID); err != nil {
+		reason := "limits state refresh failed: " + err.Error()
+		if recErr := d.record(reqID, "execute_fee_set", raw, "executed",
+			reason); recErr != nil {
+
+			return ledgerFailure(reqID, recErr)
+		}
+		return Response{Status: "ok", RequestID: reqID,
+			Result: map[string]interface{}{
+				"executed": true,
+				"chan_id":  p.ChanID,
+				"warning":  reason,
+			}}
+	}
 	if err := d.record(reqID, "execute_fee_set", raw, "executed", ""); err != nil {
 		return ledgerFailure(reqID, err)
 	}

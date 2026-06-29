@@ -4,6 +4,9 @@
 package limits_test
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/config"
@@ -20,6 +23,15 @@ func newEngine(t *testing.T, cfg config.Limits) *limits.Engine {
 	eng, err := limits.New(cfg)
 	if err != nil {
 		t.Fatalf("limits.New: %v", err)
+	}
+	return eng
+}
+
+func newPersistentEngine(t *testing.T, cfg config.Limits, path string) *limits.Engine {
+	t.Helper()
+	eng, err := limits.NewPersistent(cfg, path)
+	if err != nil {
+		t.Fatalf("limits.NewPersistent: %v", err)
 	}
 	return eng
 }
@@ -142,6 +154,150 @@ func TestCheckRebalance_Cooldown(t *testing.T) {
 	// Different channel is unaffected.
 	if err := eng.CheckRebalance(99, 100, 50); err != nil {
 		t.Errorf("different channel should not be in cooldown: %v", err)
+	}
+}
+
+func TestPersistentDailyBudgetSurvivesRestart(t *testing.T) {
+	cfg := config.Limits{
+		DailyRebalanceBudgetSat: 1000,
+		MaxFeePpmDelta:          1000,
+		PerChannelCooldown:      "0s",
+		RebalanceMaxFeePpm:      1000,
+	}
+	path := filepath.Join(t.TempDir(), "limits-state.json")
+
+	eng := newPersistentEngine(t, cfg, path)
+	if err := eng.CheckRebalance(1, 600, 100); err != nil {
+		t.Fatalf("first rebalance should be allowed: %v", err)
+	}
+	if err := eng.RecordRebalance(1, 600); err != nil {
+		t.Fatalf("RecordRebalance: %v", err)
+	}
+
+	restarted := newPersistentEngine(t, cfg, path)
+	if err := restarted.CheckRebalance(2, 500, 100); err == nil {
+		t.Fatal("expected persisted daily budget exhaustion after restart")
+	}
+	if err := restarted.CheckRebalance(2, 400, 100); err != nil {
+		t.Fatalf("expected exact persisted remaining budget to be allowed: %v", err)
+	}
+}
+
+func TestPersistentCooldownSurvivesRestart(t *testing.T) {
+	cfg := config.Limits{
+		DailyRebalanceBudgetSat: 1_000_000,
+		MaxFeePpmDelta:          1000,
+		PerChannelCooldown:      "1h",
+		RebalanceMaxFeePpm:      1000,
+	}
+	path := filepath.Join(t.TempDir(), "limits-state.json")
+
+	eng := newPersistentEngine(t, cfg, path)
+	if err := eng.RecordChannelOperation(42); err != nil {
+		t.Fatalf("RecordChannelOperation: %v", err)
+	}
+
+	restarted := newPersistentEngine(t, cfg, path)
+	if err := restarted.CheckChannelCooldown(42); err == nil ||
+		!strings.Contains(err.Error(), "cooldown") {
+
+		t.Fatalf("expected persisted cooldown after restart, got %v", err)
+	}
+	if err := restarted.CheckChannelCooldown(99); err != nil {
+		t.Fatalf("different channel should not be in cooldown: %v", err)
+	}
+}
+
+func TestNewPersistentRejectsCorruptState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "limits-state.json")
+	if err := os.WriteFile(path, []byte(`{"daily_spent_sat":-1}`), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := limits.NewPersistent(config.Limits{PerChannelCooldown: "0s"}, path)
+	if err == nil || !strings.Contains(err.Error(), "daily_spent_sat") {
+		t.Fatalf("expected corrupt state error, got %v", err)
+	}
+}
+
+func TestNewPersistentRejectsIncompleteState(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{
+			name:    "missing daily spent",
+			body:    `{"last_reset_day":"2026-01-01","channel_last_op":{}}`,
+			wantErr: "daily_spent_sat",
+		},
+		{
+			name:    "missing reset day",
+			body:    `{"daily_spent_sat":0,"channel_last_op":{}}`,
+			wantErr: "last_reset_day",
+		},
+		{
+			name:    "malformed reset day",
+			body:    `{"daily_spent_sat":0,"last_reset_day":"not-a-day","channel_last_op":{}}`,
+			wantErr: "last_reset_day",
+		},
+		{
+			name:    "missing channel cooldowns",
+			body:    `{"daily_spent_sat":0,"last_reset_day":"2026-01-01"}`,
+			wantErr: "channel_last_op",
+		},
+		{
+			name:    "null channel cooldowns",
+			body:    `{"daily_spent_sat":0,"last_reset_day":"2026-01-01","channel_last_op":null}`,
+			wantErr: "channel_last_op",
+		},
+		{
+			name:    "null channel cooldown entry",
+			body:    `{"daily_spent_sat":0,"last_reset_day":"2026-01-01","channel_last_op":{"42":null}}`,
+			wantErr: "channel_last_op",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "limits-state.json")
+			if err := os.WriteFile(path, []byte(tc.body), 0600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+
+			_, err := limits.NewPersistent(config.Limits{PerChannelCooldown: "0s"}, path)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected %q error, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestRollbackChannelOperationPreservesNewerCooldown(t *testing.T) {
+	cfg := config.Limits{
+		DailyRebalanceBudgetSat: 1_000_000,
+		MaxFeePpmDelta:          1000,
+		PerChannelCooldown:      "0s",
+		RebalanceMaxFeePpm:      1000,
+	}
+	path := filepath.Join(t.TempDir(), "limits-state.json")
+
+	eng := newPersistentEngine(t, cfg, path)
+	older, err := eng.ReserveChannelOperation(42)
+	if err != nil {
+		t.Fatalf("first ReserveChannelOperation: %v", err)
+	}
+	if _, err := eng.ReserveChannelOperation(42); err != nil {
+		t.Fatalf("second ReserveChannelOperation: %v", err)
+	}
+	if err := eng.RollbackChannelOperation(older); err != nil {
+		t.Fatalf("RollbackChannelOperation: %v", err)
+	}
+
+	cfg.PerChannelCooldown = "1h"
+	restarted := newPersistentEngine(t, cfg, path)
+	if err := restarted.CheckChannelCooldown(42); err == nil ||
+		!strings.Contains(err.Error(), "cooldown") {
+
+		t.Fatalf("expected newer persisted cooldown after stale rollback, got %v", err)
 	}
 }
 
