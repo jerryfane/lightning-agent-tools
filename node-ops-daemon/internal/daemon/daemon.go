@@ -27,6 +27,7 @@ import (
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/killswitch"
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/ledger"
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/limits"
+	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/monitor"
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/queue"
 )
 
@@ -59,6 +60,7 @@ type Daemon struct {
 	ledger   *ledger.Ledger
 	queue    *queue.Queue
 	executor executor.NodeExecutor
+	monitor  *monitor.Monitor
 	execMu   sync.Mutex
 }
 
@@ -78,13 +80,61 @@ func New(cfg *config.Config, exec executor.NodeExecutor) (*Daemon, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ledger: %w", err)
 	}
+	mon, err := newHealthMonitor(cfg, exec)
+	if err != nil {
+		l.Close()
+		return nil, err
+	}
 	return &Daemon{
 		cfg:      cfg,
 		limits:   eng,
 		ledger:   l,
 		queue:    queue.New(),
 		executor: exec,
+		monitor:  mon,
 	}, nil
+}
+
+func newHealthMonitor(cfg *config.Config,
+	exec executor.NodeExecutor) (*monitor.Monitor, error) {
+
+	if !cfg.Monitor.Enabled {
+		return nil, nil
+	}
+	if _, ok := exec.(*executor.StubExecutor); ok {
+		return nil, fmt.Errorf("monitor requires a concrete node_health reader")
+	}
+	pollInterval, err := time.ParseDuration(cfg.Monitor.PollInterval)
+	if err != nil {
+		return nil, fmt.Errorf("monitor poll interval: %w", err)
+	}
+	alertCooldown, err := time.ParseDuration(cfg.Monitor.AlertCooldown)
+	if err != nil {
+		return nil, fmt.Errorf("monitor alert cooldown: %w", err)
+	}
+
+	var publisher monitor.Publisher
+	switch cfg.Monitor.AlertChannel {
+	case "file":
+		publisher, err = monitor.NewJSONLPublisher(cfg.Monitor.AlertPath)
+	case "stdout":
+		publisher, err = monitor.NewWriterPublisher(os.Stdout)
+	default:
+		err = fmt.Errorf("unsupported monitor alert channel %q",
+			cfg.Monitor.AlertChannel)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("monitor alert publisher: %w", err)
+	}
+
+	mon, err := monitor.New(exec, publisher, monitor.Config{
+		PollInterval:  pollInterval,
+		AlertCooldown: alertCooldown,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("monitor: %w", err)
+	}
+	return mon, nil
 }
 
 // Close releases the ledger handle.
@@ -111,8 +161,24 @@ func (d *Daemon) Run(ctx context.Context, sockPath string) error {
 		return fmt.Errorf("chmod socket: %w", err)
 	}
 
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var monitorDone chan struct{}
+	if d.monitor != nil {
+		monitorDone = make(chan struct{})
+		go func() {
+			defer close(monitorDone)
+			d.monitor.Run(runCtx)
+		}()
+		defer func() {
+			cancel()
+			<-monitorDone
+		}()
+	}
+
 	go func() {
-		<-ctx.Done()
+		<-runCtx.Done()
 		ln.Close()
 	}()
 
@@ -327,10 +393,26 @@ func auditEntryFromLedger(entry ledger.Entry) auditEntryResult {
 }
 
 func (d *Daemon) statusResult() map[string]string {
-	if killswitch.Active(d.cfg.Storage.KillswitchFile) {
-		return map[string]string{"state": "stopped", "killswitch": "active"}
+	monitorState := "disabled"
+	if d.monitor != nil {
+		monitorState = "enabled"
 	}
-	return map[string]string{"state": "running", "killswitch": "inactive"}
+	result := map[string]string{
+		"state":      "running",
+		"killswitch": "inactive",
+		"monitor":    monitorState,
+	}
+	if killswitch.Active(d.cfg.Storage.KillswitchFile) {
+		result["state"] = "stopped"
+		result["killswitch"] = "active"
+	}
+	if d.monitor != nil {
+		if msg, at, ok := d.monitor.LastError(); ok {
+			result["monitor_error"] = msg
+			result["monitor_error_at"] = at.Format(time.RFC3339)
+		}
+	}
+	return result
 }
 
 func (d *Daemon) rejectIfKillSwitchActive(reqID, action string,

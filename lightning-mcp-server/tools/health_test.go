@@ -125,10 +125,16 @@ func TestHealthService_CriticalAlertsArePrioritized(t *testing.T) {
 
 	alerts := out["alerts"].([]any)
 	require.Len(t, alerts, 3)
+	assert.Equal(t, "channel:force-close:force:0",
+		alerts[0].(map[string]any)["id"])
 	assert.Equal(t, "critical",
 		alerts[0].(map[string]any)["severity"])
+	assert.Equal(t, "sync:graph",
+		alerts[1].(map[string]any)["id"])
 	assert.Equal(t, "warning",
 		alerts[1].(map[string]any)["severity"])
+	assert.Equal(t, "peer:flap:peer",
+		alerts[2].(map[string]any)["id"])
 	assert.Equal(t, "warning",
 		alerts[2].(map[string]any)["severity"])
 }

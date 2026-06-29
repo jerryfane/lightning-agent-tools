@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -52,11 +53,30 @@ type Storage struct {
 	KillswitchFile string `toml:"killswitch"`
 }
 
+// Monitor controls background read-only node health polling and alert output.
+type Monitor struct {
+	// Enabled starts the background monitor when the daemon starts.
+	Enabled bool `toml:"enabled"`
+
+	// PollInterval is a Go duration string for node_health polling.
+	PollInterval string `toml:"poll_interval"`
+
+	// AlertCooldown suppresses duplicate alert pushes for this duration.
+	AlertCooldown string `toml:"alert_cooldown"`
+
+	// AlertChannel selects where alerts are pushed: "file" or "stdout".
+	AlertChannel string `toml:"alert_channel"`
+
+	// AlertPath is the JSONL destination when AlertChannel is "file".
+	AlertPath string `toml:"alert_path"`
+}
+
 // Config is the root configuration for the daemon.
 type Config struct {
 	Limits   Limits   `toml:"limits"`
 	Approval Approval `toml:"approval"`
 	Storage  Storage  `toml:"storage"`
+	Monitor  Monitor  `toml:"monitor"`
 }
 
 // DefaultPath returns the canonical config path for the current user.
@@ -85,6 +105,13 @@ func Defaults() *Config {
 			LimitsStatePath: filepath.Join(base, "limits-state.json"),
 			KillswitchFile:  filepath.Join(base, "STOP"),
 		},
+		Monitor: Monitor{
+			Enabled:       false,
+			PollInterval:  "30s",
+			AlertCooldown: "10m",
+			AlertChannel:  "file",
+			AlertPath:     filepath.Join(base, "alerts.jsonl"),
+		},
 	}
 }
 
@@ -112,6 +139,7 @@ func (c *Config) expand() error {
 	c.Storage.LedgerPath = expandHome(c.Storage.LedgerPath, home)
 	c.Storage.LimitsStatePath = expandHome(c.Storage.LimitsStatePath, home)
 	c.Storage.KillswitchFile = expandHome(c.Storage.KillswitchFile, home)
+	c.Monitor.AlertPath = expandHome(c.Monitor.AlertPath, home)
 	return nil
 }
 
@@ -124,6 +152,35 @@ func (c *Config) validate() error {
 	}
 	if strings.TrimSpace(c.Storage.KillswitchFile) == "" {
 		return fmt.Errorf("storage.killswitch must not be empty")
+	}
+	if err := validateDuration("monitor.poll_interval", c.Monitor.PollInterval, true); err != nil {
+		return err
+	}
+	if err := validateDuration("monitor.alert_cooldown", c.Monitor.AlertCooldown, false); err != nil {
+		return err
+	}
+	switch c.Monitor.AlertChannel {
+	case "file":
+		if strings.TrimSpace(c.Monitor.AlertPath) == "" {
+			return fmt.Errorf("monitor.alert_path must not be empty when alert_channel is file")
+		}
+	case "stdout":
+	default:
+		return fmt.Errorf("monitor.alert_channel must be file or stdout")
+	}
+	return nil
+}
+
+func validateDuration(name, value string, requirePositive bool) error {
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return fmt.Errorf("%s %q: %w", name, value, err)
+	}
+	if requirePositive && d <= 0 {
+		return fmt.Errorf("%s %q must be positive", name, value)
+	}
+	if !requirePositive && d < 0 {
+		return fmt.Errorf("%s %q must be non-negative", name, value)
 	}
 	return nil
 }

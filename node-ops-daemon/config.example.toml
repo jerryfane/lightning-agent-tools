@@ -30,3 +30,21 @@ limits_state = "~/.node-ops/limits-state.json"
 
 # Creating this file halts all daemon execution immediately.
 killswitch = "~/.node-ops/STOP"
+
+[monitor]
+# Start a background read-only node_health poller when the daemon starts.
+# Requires a concrete node_health reader; the fail-closed stub rejects startup
+# if monitoring is enabled without one.
+enabled = false
+
+# How often to poll node_health for force-close, health, and peer alerts.
+poll_interval = "30s"
+
+# Suppress duplicate pushes for the same alert during this window.
+alert_cooldown = "10m"
+
+# Where to push alerts. Supported values: "file" or "stdout".
+alert_channel = "file"
+
+# JSONL alert destination used when alert_channel = "file".
+alert_path = "~/.node-ops/alerts.jsonl"

@@ -18,6 +18,7 @@ import (
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/config"
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/executor"
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/ledger"
+	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/monitor"
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/queue"
 )
 
@@ -70,6 +71,8 @@ func newTestDaemonWithExecutor(t *testing.T, mutate func(*config.Config),
 type fakeExecutor struct {
 	mu         sync.Mutex
 	current    map[uint64]executor.FeePolicy
+	health     executor.NodeHealthSnapshot
+	healthErr  error
 	executed   []executor.FeeSetRequest
 	onCurrent  func()
 	onExecute  func()
@@ -113,9 +116,179 @@ func (f *fakeExecutor) ExecuteFeeSet(_ context.Context,
 	return nil
 }
 
+func (f *fakeExecutor) NodeHealth(_ context.Context) (executor.NodeHealthSnapshot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.healthErr != nil {
+		return executor.NodeHealthSnapshot{}, f.healthErr
+	}
+	return f.health, nil
+}
+
 func mustJSON(t *testing.T, s string) json.RawMessage {
 	t.Helper()
 	return json.RawMessage(s)
+}
+
+func forceCloseHealthSnapshot() executor.NodeHealthSnapshot {
+	return executor.NodeHealthSnapshot{
+		OverallStatus: "critical",
+		AlertCount:    1,
+		CriticalCount: 1,
+		NodeID:        "node-123",
+		Alias:         "regtest-node",
+		SyncedToChain: true,
+		SyncedToGraph: true,
+		BlockHeight:   144,
+		Alerts: []executor.HealthAlert{{
+			ID:       "channel:force-close:txid:0",
+			Severity: "critical",
+			Category: "channel",
+			Message:  "Force-closing channel detected",
+			Details: map[string]interface{}{
+				"channel_point":       "txid:0",
+				"remote_node_pub":     "remote",
+				"closing_txid":        "close-tx",
+				"blocks_til_maturity": 3,
+			},
+		}},
+	}
+}
+
+func TestRunMonitorPushesAlertToConfiguredFile(t *testing.T) {
+	alertPath := filepath.Join(t.TempDir(), "node-ops", "alerts.jsonl")
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{})
+	fake.health = forceCloseHealthSnapshot()
+	d := newTestDaemonWithExecutor(t, func(cfg *config.Config) {
+		cfg.Monitor.Enabled = true
+		cfg.Monitor.PollInterval = "10ms"
+		cfg.Monitor.AlertCooldown = "1h"
+		cfg.Monitor.AlertChannel = "file"
+		cfg.Monitor.AlertPath = alertPath
+	}, fake)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	sockPath := filepath.Join(t.TempDir(), "daemon.sock")
+	go func() {
+		errCh <- d.Run(ctx, sockPath)
+	}()
+
+	var body []byte
+	deadline := time.After(2 * time.Second)
+	for {
+		var err error
+		body, err = os.ReadFile(alertPath)
+		if err == nil && strings.Contains(string(body), "Force-closing channel detected") {
+			break
+		}
+		select {
+		case err := <-errCh:
+			t.Fatalf("Run exited before alert was written: %v", err)
+		case <-deadline:
+			t.Fatalf("timed out waiting for alert file, body=%q err=%v", body, err)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var event struct {
+		ID       string `json:"id"`
+		Severity string `json:"severity"`
+		Category string `json:"category"`
+		Message  string `json:"message"`
+		NodeID   string `json:"node_id"`
+	}
+	line := strings.Split(strings.TrimSpace(string(body)), "\n")[0]
+	if err := json.Unmarshal([]byte(line), &event); err != nil {
+		t.Fatalf("decode alert event: %v", err)
+	}
+	if event.ID != "channel:force-close:txid:0" ||
+		event.Severity != "critical" || event.Category != "channel" ||
+		event.NodeID != "node-123" {
+
+		t.Fatalf("unexpected alert event: %+v", event)
+	}
+}
+
+func TestNewRejectsEnabledMonitorWithStubExecutor(t *testing.T) {
+	cfg := config.Defaults()
+	dir := filepath.Join(t.TempDir(), "node-ops")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatalf("Mkdir store dir: %v", err)
+	}
+	cfg.Storage.LedgerPath = filepath.Join(dir, "ledger.db")
+	cfg.Storage.LimitsStatePath = filepath.Join(dir, "limits-state.json")
+	cfg.Storage.KillswitchFile = filepath.Join(dir, "STOP")
+	cfg.Monitor.Enabled = true
+	cfg.Monitor.AlertPath = filepath.Join(dir, "alerts.jsonl")
+
+	d, err := New(cfg, &executor.StubExecutor{})
+	if err == nil {
+		d.Close()
+		t.Fatal("expected monitor startup rejection with stub executor")
+	}
+	if !strings.Contains(err.Error(), "concrete node_health reader") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+type failingAlertPublisher struct{}
+
+func (f failingAlertPublisher) Publish(context.Context, monitor.AlertEvent) error {
+	return errors.New("alert sink down")
+}
+
+func TestStatusReportsMonitorLastError(t *testing.T) {
+	fake := newFakeExecutor(map[uint64]executor.FeePolicy{})
+	fake.health = forceCloseHealthSnapshot()
+	mon, err := monitor.New(fake, failingAlertPublisher{}, monitor.Config{
+		PollInterval:  10 * time.Millisecond,
+		AlertCooldown: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("monitor New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		mon.Run(ctx)
+	}()
+
+	deadline := time.After(time.Second)
+	for {
+		if msg, _, ok := mon.LastError(); ok &&
+			strings.Contains(msg, "alert sink down") {
+
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for monitor error")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+
+	cfg := config.Defaults()
+	cfg.Storage.KillswitchFile = filepath.Join(t.TempDir(), "STOP")
+	status := (&Daemon{cfg: cfg, monitor: mon}).statusResult()
+	if !strings.Contains(status["monitor_error"], "alert sink down") {
+		t.Fatalf("monitor_error = %q", status["monitor_error"])
+	}
+	if status["monitor_error_at"] == "" {
+		t.Fatalf("monitor_error_at was not set: %+v", status)
+	}
 }
 
 func TestDispatchRejectsOverCapAndLogs(t *testing.T) {

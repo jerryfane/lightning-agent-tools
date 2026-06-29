@@ -58,6 +58,7 @@ func (s *HealthService) HandleNodeHealth(ctx context.Context,
 
 	if !info.SyncedToChain {
 		alerts = append(alerts, map[string]any{
+			"id":       "sync:chain",
 			"severity": "critical",
 			"category": "sync",
 			"message":  "Node is NOT synced to chain",
@@ -65,6 +66,7 @@ func (s *HealthService) HandleNodeHealth(ctx context.Context,
 	}
 	if !info.SyncedToGraph {
 		alerts = append(alerts, map[string]any{
+			"id":       "sync:graph",
 			"severity": "warning",
 			"category": "sync",
 			"message":  "Node is NOT synced to graph",
@@ -82,6 +84,7 @@ func (s *HealthService) HandleNodeHealth(ctx context.Context,
 
 	for _, ch := range pending.PendingForceClosingChannels {
 		alerts = append(alerts, map[string]any{
+			"id":                  healthAlertID("channel:force-close", ch.Channel.ChannelPoint),
 			"severity":            "critical",
 			"category":            "channel",
 			"message":             "Force-closing channel detected",
@@ -95,6 +98,7 @@ func (s *HealthService) HandleNodeHealth(ctx context.Context,
 
 	for _, ch := range pending.WaitingCloseChannels {
 		alerts = append(alerts, map[string]any{
+			"id":                healthAlertID("channel:waiting-close", ch.Channel.ChannelPoint),
 			"severity":          "warning",
 			"category":          "channel",
 			"message":           "Channel waiting to close",
@@ -117,6 +121,7 @@ func (s *HealthService) HandleNodeHealth(ctx context.Context,
 	for _, peer := range peers.Peers {
 		if peer.FlapCount >= flapThreshold {
 			alerts = append(alerts, map[string]any{
+				"id":         healthAlertID("peer:flap", peer.PubKey),
 				"severity":   "warning",
 				"category":   "peer",
 				"message":    fmt.Sprintf("Peer has high flap count (%d)", peer.FlapCount),
@@ -162,6 +167,13 @@ func (s *HealthService) HandleNodeHealth(ctx context.Context,
 		"synced_to_graph": info.SyncedToGraph,
 		"block_height":    info.BlockHeight,
 	}), nil
+}
+
+func healthAlertID(prefix, key string) string {
+	if key == "" {
+		return prefix
+	}
+	return prefix + ":" + key
 }
 
 func healthSeverityRank(severity any) int {
