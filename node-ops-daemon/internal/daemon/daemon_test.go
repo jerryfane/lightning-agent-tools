@@ -17,6 +17,7 @@ import (
 
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/config"
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/executor"
+	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/ledger"
 	"github.com/lightninglabs/lightning-agent-kit/node-ops-daemon/internal/queue"
 )
 
@@ -670,6 +671,101 @@ func TestDispatchKillSwitchHaltsAndLogs(t *testing.T) {
 		entries[0].Reason != "killswitch active" {
 
 		t.Fatalf("unexpected ledger entries: %+v", entries)
+	}
+}
+
+func TestDispatchQueryAuditLogIsQueryableAndReadOnly(t *testing.T) {
+	d := newTestDaemon(t, nil)
+
+	rejected := d.dispatch(Request{
+		Action: "execute_fee_set",
+		Params: mustJSON(t, `{"chan_id":1,"base_msat":1000,"fee_ppm":250}`),
+	})
+	if rejected.Status != "error" {
+		t.Fatalf("expected rejected setup request, got %+v", rejected)
+	}
+	status := d.dispatch(Request{Action: "status"})
+	if status.Status != "ok" {
+		t.Fatalf("expected status setup request, got %+v", status)
+	}
+
+	firstQuery := d.dispatch(Request{
+		Action: "query_audit_log",
+		Params: mustJSON(t, `{"action":"execute_fee_set","limit":10,"newest_first":false}`),
+	})
+	if firstQuery.Status != "ok" {
+		t.Fatalf("expected query ok, got %+v", firstQuery)
+	}
+	result, ok := firstQuery.Result.(auditQueryResult)
+	if !ok {
+		t.Fatalf("unexpected query result type: %#v", firstQuery.Result)
+	}
+	if result.Count != 1 {
+		t.Fatalf("expected one filtered entry, got %+v", result)
+	}
+	entry := result.Entries[0]
+	if entry.Action != "execute_fee_set" || entry.Status != "rejected" {
+		t.Fatalf("unexpected audit entry: %+v", entry)
+	}
+	if string(entry.Params) != `{"chan_id":1,"base_msat":1000,"fee_ppm":250}` {
+		t.Fatalf("unexpected raw params: %s", entry.Params)
+	}
+
+	secondQuery := d.dispatch(Request{
+		Action: "query_audit_log",
+		Params: mustJSON(t, `{"limit":10,"newest_first":false}`),
+	})
+	if secondQuery.Status != "ok" {
+		t.Fatalf("expected second query ok, got %+v", secondQuery)
+	}
+	secondResult, ok := secondQuery.Result.(auditQueryResult)
+	if !ok {
+		t.Fatalf("unexpected second query result type: %#v", secondQuery.Result)
+	}
+	if secondResult.Count != 2 {
+		t.Fatalf("query should not append audit rows, got %+v", secondResult)
+	}
+}
+
+func TestDispatchQueryAuditLogValidation(t *testing.T) {
+	d := newTestDaemon(t, nil)
+
+	resp := d.dispatch(Request{
+		Action: "query_audit_log",
+		Params: mustJSON(t, `{"limit":0}`),
+	})
+	if resp.Status != "error" || !strings.Contains(resp.Reason, "limit") {
+		t.Fatalf("expected limit validation error, got %+v", resp)
+	}
+
+	resp = d.dispatch(Request{
+		Action: "query_audit_log",
+		Params: mustJSON(t, `{"offset":-1}`),
+	})
+	if resp.Status != "error" || !strings.Contains(resp.Reason, "offset") {
+		t.Fatalf("expected offset validation error, got %+v", resp)
+	}
+}
+
+func TestAuditEntryFromLedgerTruncatesLargeParams(t *testing.T) {
+	entry := auditEntryFromLedger(ledger.Entry{
+		ID:        1,
+		RequestID: "req-1",
+		Action:    "execute_fee_set",
+		Params:    `{"payload":"` + strings.Repeat("x", maxAuditParamBytes+1) + `"}`,
+		Status:    "rejected",
+		CreatedAt: time.Now().UTC(),
+	})
+
+	if !entry.ParamsTruncated {
+		t.Fatalf("expected params to be truncated: %+v", entry)
+	}
+	if len(entry.ParamsPreview) != maxAuditParamBytes {
+		t.Fatalf("preview length = %d, want %d",
+			len(entry.ParamsPreview), maxAuditParamBytes)
+	}
+	if len(entry.Params) != 0 {
+		t.Fatalf("truncated entry should omit full params: %s", entry.Params)
 	}
 }
 

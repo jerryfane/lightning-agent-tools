@@ -39,6 +39,7 @@ type Manager struct {
 	healthService         *tools.HealthService
 	rebalanceService      *tools.RebalanceService
 	feeService            *tools.FeeService
+	nodeOpsAuditService   *tools.NodeOpsAuditService
 }
 
 // NewManager creates a new service manager for read-only operations.
@@ -68,6 +69,8 @@ func (m *Manager) InitializeServices() {
 	m.healthService = tools.NewHealthService(nil)
 	m.rebalanceService = tools.NewRebalanceService(nil)
 	m.feeService = tools.NewFeeService(nil)
+	m.nodeOpsAuditService = tools.NewNodeOpsAuditService(
+		tools.DefaultNodeOpsDaemonSocket())
 
 	m.logger.Info("Read-only services initialized successfully")
 }
@@ -149,6 +152,10 @@ func (m *Manager) RegisterTools(mcpServer interfaces.MCPServer) error {
 	// Fee proposal tool - read-only operations.
 	register(m.feeService.ProposeFeesTool(),
 		m.feeService.HandleProposeFees)
+
+	// Node-ops audit query tool - read-only local daemon inspection.
+	register(m.nodeOpsAuditService.QueryAuditLedgerTool(),
+		m.nodeOpsAuditService.HandleQueryAuditLedger)
 
 	m.logger.Info("Read-only MCP tools registered",
 		zap.Int("total_tools", registrations))
